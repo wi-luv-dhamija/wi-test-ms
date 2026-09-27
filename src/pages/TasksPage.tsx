@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { TaskCard } from '../components/TaskCard';
 import { TaskForm } from '../components/TaskForm';
+import { TaskToolbar, type TaskViewMode } from '../components/TaskToolbar';
 import { useTasks } from '../hooks/useTasks';
 import type { Task } from '../types/task';
 import styles from './TasksPage.module.css';
@@ -9,6 +10,7 @@ export function TasksPage() {
   const { tasks, addTask, updateTask, changeStatus, deleteTask } = useTasks();
   const [isCreating, setIsCreating] = useState(false);
   const [editing, setEditing] = useState<Task | null>(null);
+  const [viewMode, setViewMode] = useState<TaskViewMode>('grid');
 
   const closeForm = () => {
     setIsCreating(false);
@@ -17,14 +19,12 @@ export function TasksPage() {
 
   return (
     <>
-      <div className="page-header">
-        <h1>Tasks</h1>
-        {!isCreating && !editing && (
-          <button type="button" className="btn btn-primary" onClick={() => setIsCreating(true)}>
-            Add task
-          </button>
-        )}
-      </div>
+      <TaskToolbar
+        viewMode={viewMode}
+        onViewModeChange={setViewMode}
+        canAddTask={!isCreating && !editing}
+        onAddTask={() => setIsCreating(true)}
+      />
 
       {isCreating && (
         <TaskForm
@@ -53,11 +53,16 @@ export function TasksPage() {
       {tasks.length === 0 ? (
         <p className="muted">No tasks yet. Add one to get started.</p>
       ) : (
-        <div className={styles.grid}>
+        <div
+          className={viewMode === 'grid' ? styles.grid : styles.list}
+          data-testid="task-collection"
+          data-view={viewMode}
+        >
           {tasks.map((task) => (
             <TaskCard
               key={task.id}
               task={task}
+              compact={viewMode === 'list'}
               onStatusChange={changeStatus}
               onEdit={(t) => {
                 setIsCreating(false);
