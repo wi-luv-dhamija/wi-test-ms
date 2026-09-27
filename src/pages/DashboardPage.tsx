@@ -1,5 +1,6 @@
 import { Link } from 'react-router';
 import { StatCard } from '../components/StatCard';
+import { TaskCompletionProgress } from '../components/TaskCompletionProgress';
 import { StatusBadge } from '../components/StatusBadge';
 import { useTasks } from '../hooks/useTasks';
 import { formatDate } from '../utils/date';
@@ -22,6 +23,7 @@ export function DashboardPage() {
         <StatCard label="In progress" value={stats.inProgress} />
         <StatCard label="Pending" value={stats.pending} />
       </div>
+      <TaskCompletionProgress completed={stats.completed} total={stats.total} />
       <section className={styles.section} aria-labelledby="recent-heading">
         <div className={styles.sectionHeader}>
           <h2 id="recent-heading">Recent tasks</h2>
