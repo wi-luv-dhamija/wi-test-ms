@@ -3,7 +3,7 @@
 // touched the failing code, and heuristic hints. It only reports, never changes code, and
 // never claims a root cause.
 // Reads (from $RUNNER_TEMP/poc-state): failure.json, prs.json, vitest-report.json
-// Writes: candidate-test-diagnosis.json, test-diagnosis.md
+// Writes: candidate-test-diagnosis.json, diagnosis.md
 import { appendFileSync, existsSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
@@ -244,7 +244,7 @@ if (interactionFound) {
 md.push(`${step++}. Fix the appropriate source PR branch and push the fix.`);
 md.push(`${step++}. Re-run that PR's individual CI.`);
 md.push(`${step++}. Rebuild the release candidate.`);
-writeFileSync(path.join(state, 'test-diagnosis.md'), md.join('\n') + '\n');
+writeFileSync(path.join(state, 'diagnosis.md'), md.join('\n') + '\n');
 
 if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, 'diagnosed=true\n');
 console.log(md.join('\n'));

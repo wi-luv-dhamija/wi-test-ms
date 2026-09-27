@@ -67,6 +67,16 @@ It never names a root cause and never changes code. It uploads `vitest-report.js
 types are `MERGE_CONFLICT`, `MERGE_FAILED`, `INSTALL_FAILED`, `LINT_FAILED`, `TEST_FAILED`,
 `BUILD_FAILED`, `STALE_PR` and `STALE_MAIN`.
 
+### Merge-conflict diagnosis
+
+When a PR can't be merged into the cumulative candidate (`MERGE_CONFLICT`), the summary lists the
+exact conflicted files, the earlier selected PRs that changed those files, and pairwise checks
+(`base main + earlier PR + failing PR` for each earlier PR). The pairwise checks show which PR
+reproduces the conflict on its own. They run in memory with `git merge-tree`, from the captured
+base SHA and PR head SHAs, so nothing is checked out or pushed. The summary ends with suggested
+collaborators and resolution steps, and `candidate-merge-diagnosis.json` is uploaded with the
+diagnosis artifact.
+
 ### Triggering it
 
 The workflow file must be on `main` before GitHub shows it. The candidate always starts from

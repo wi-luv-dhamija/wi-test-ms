@@ -43,9 +43,10 @@ report_failure() { # <pr number> <pr title>
     printf 'FAILURE_TYPE=%q\nFAILED_PR=%q\nFAILED_PR_TITLE=%q\nPASSED_PRS=%q\nFAILED_COMBINATION=%q\n' \
       "$failure" "$1" "$2" "$passed_csv" "${passed_csv:+$passed_csv,}#$1"
   } >>"$state/result.env"
-  # Machine-readable copy for the test-failure diagnosis.
-  jq -n --arg type "$failure" --argjson pr "$1" --arg passed "$passed_csv" \
-    '{failure_type: $type, failed_pr: $pr, passed_prs: ($passed | [scan("[0-9]+") | tonumber])}' \
+  # Machine-readable copy for the failure diagnosis scripts.
+  jq -n --arg type "$failure" --argjson pr "$1" --arg passed "$passed_csv" --arg conflicts "${conflicts:-}" \
+    '{failure_type: $type, failed_pr: $pr, passed_prs: ($passed | [scan("[0-9]+") | tonumber]),
+      conflicting_files: ($conflicts | split("\n") | map(select(length > 0)))}' \
     >"$state/failure.json"
   echo
   echo "CANDIDATE FAILED"
@@ -65,8 +66,13 @@ report_failure() { # <pr number> <pr title>
   echo "Failure type:"
   echo "$failure"
   echo
-  echo "PR #$1 is the first addition after which the combined candidate failed."
-  echo "The cause may be the PR itself or an interaction with the PRs merged before it."
+  if [[ "$failure" == MERGE_CONFLICT ]]; then
+    echo "PR #$1 is the first addition that Git could not merge into the cumulative candidate."
+    echo "The conflict may involve this PR and one or more changes introduced by earlier selected PRs."
+  else
+    echo "PR #$1 is the first addition after which the combined candidate failed."
+    echo "The cause may be the PR itself or an interaction with the PRs merged before it."
+  fi
   exit 1
 }
 
@@ -85,6 +91,7 @@ for ((i = 0; i < total; i++)); do
   if git merge --no-ff --no-edit --quiet -m "Candidate $CANDIDATE_ID: add PR #$number ($sha)" "$sha"; then
     echo "MERGE: PASS"
   else
+    # Capture every unmerged path before the merge is aborted.
     conflicts=$(git diff --name-only --diff-filter=U)
     if [[ -n "$conflicts" ]]; then
       failure=MERGE_CONFLICT

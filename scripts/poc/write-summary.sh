@@ -72,11 +72,16 @@ STATUS=${STATUS:-FAILED}
         echo
         echo "**Failed combination:** $FAILED_COMBINATION"
         echo
-        echo "PR #$FAILED_PR is the first addition after which the combined candidate failed." \
-          "The root cause may be PR #$FAILED_PR itself or an interaction with earlier PRs."
+        if [[ "$FAILURE_TYPE" == MERGE_CONFLICT ]]; then
+          echo "PR #$FAILED_PR is the first addition that Git could not merge into the cumulative candidate." \
+            "The conflict may involve this PR and one or more changes introduced by earlier selected PRs."
+        else
+          echo "PR #$FAILED_PR is the first addition after which the combined candidate failed." \
+            "The root cause may be PR #$FAILED_PR itself or an interaction with earlier PRs."
+        fi
         echo
-        if [[ -f "$state/test-diagnosis.md" ]]; then
-          cat "$state/test-diagnosis.md"
+        if [[ -f "$state/diagnosis.md" ]]; then
+          cat "$state/diagnosis.md"
           echo
           echo "Diagnosis artifacts: \`candidate-diagnosis-$CANDIDATE_ID\`"
         fi

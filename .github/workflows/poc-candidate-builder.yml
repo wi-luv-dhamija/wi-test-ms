@@ -3,8 +3,9 @@ run-name: Candidate ${{ inputs.candidate_id }} (PRs ${{ inputs.prs }})
 
 # Combines the latest main with an ordered list of PRs, validating each cumulative state:
 #   main + A, main + A + B, main + A + B + C
-# Read-only: nothing is merged, pushed, tagged or deployed. Output is a candidate manifest, or
-# on TEST_FAILED a diagnosis report (failed tests, likely related PRs, suggested collaborators).
+# Read-only: nothing is merged, pushed, tagged or deployed. Output is a candidate manifest, or a
+# diagnosis report on TEST_FAILED (failed tests, likely related PRs) or MERGE_CONFLICT
+# (conflicted files, overlapping PRs, pairwise merge checks), with suggested collaborators.
 on:
   workflow_dispatch:
     inputs:
@@ -89,12 +90,15 @@ jobs:
           path: ${{ runner.temp }}/poc-state/candidate-manifest.json
           if-no-files-found: error
 
-      - name: Diagnose test failure
+      # Each script exits early unless the failure type is the one it diagnoses.
+      - name: Diagnose failure
         id: diagnose
         if: failure()
-        run: node "$RUNNER_TEMP/poc-scripts/diagnose-test-failure.mjs"
+        run: |
+          node "$RUNNER_TEMP/poc-scripts/diagnose-merge-conflict.mjs"
+          node "$RUNNER_TEMP/poc-scripts/diagnose-test-failure.mjs"
 
-      - name: Upload test diagnosis
+      - name: Upload failure diagnosis
         if: failure() && steps.diagnose.outputs.diagnosed == 'true'
         uses: actions/upload-artifact@v7
         with:
@@ -102,6 +106,7 @@ jobs:
           path: |
             ${{ runner.temp }}/poc-state/vitest-report.json
             ${{ runner.temp }}/poc-state/candidate-test-diagnosis.json
+            ${{ runner.temp }}/poc-state/candidate-merge-diagnosis.json
           if-no-files-found: ignore
 
       - name: Write job summary
