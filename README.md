@@ -97,8 +97,11 @@ creates branches or changes code.
   or diagnosis) update the labels, comments and dashboard. The first failing addition becomes
   `TEST_FAILED`, `MERGE_CONFLICT` or `BLOCKED`, the passing PRs before it become `VALIDATED`,
   and the queue suggests a next candidate but never drops a PR on its own.
-- **Workflow file on `main`:** the comment and workflow-run triggers only use the version on
-  `main`.
+- **Build flow:** the run started by the `/queue build` comment waits for the candidate build
+  and then records its result, because builds started by the built-in token don't trigger other
+  workflows. If a result is ever missing, run **POC - Queue Manager** by hand with the input
+  left empty: it finds the current candidate's run and records it.
+- **Workflow file on `main`:** comment commands only use the version on `main`.
 
 ### Triggering it
 

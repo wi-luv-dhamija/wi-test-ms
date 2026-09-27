@@ -1,10 +1,7 @@
 name: POC - Queue Manager
 run-name: >-
   ${{
-    github.event_name == 'workflow_run' && format('Queue • RESULT • {0} • {1}',
-      github.event.workflow_run.display_title,
-      github.event.workflow_run.conclusion == 'success' && 'VALIDATED' || github.event.workflow_run.conclusion)
-    || github.event_name == 'workflow_dispatch' && format('Queue • RESULT • run {0}', inputs.result_run_id)
+    github.event_name == 'workflow_dispatch' && format('Queue • RESULT • {0}', inputs.result_run_id || 'current candidate')
     || github.event_name == 'pull_request' && format('Queue • PR {0} • #{1}', github.event.action, github.event.pull_request.number)
     || startsWith(github.event.comment.body, '/queue') && format('Queue • {0} • #{1} • @{2}',
       startsWith(github.event.comment.body, '/queue add') && 'ADD'
@@ -27,23 +24,26 @@ run-name: >-
 # It orchestrates only: code validation stays in "POC - Build Release Candidate", which this
 # workflow dispatches (`/queue build`) and whose artifacts it reads when the run completes.
 # It never merges, pushes, creates branches, or runs PR code.
+#
+# Build flow, all in the run of the `/queue build` comment:
+#   manage (dispatch, holds the queue lock briefly) → await-candidate (waits, no lock)
+#   → record-result (applies the result, holds the lock briefly)
+# A workflow_run trigger can't be used: runs dispatched with GITHUB_TOKEN don't emit it.
 on:
   issue_comment:
     types: [created]
-  workflow_run:
-    workflows: ['POC - Build Release Candidate']
-    types: [completed]
   # Keeps the queue honest when a queued PR is closed, merged or gets new commits. No PR code is
   # checked out. (Fork PRs get a read-only token here and are not supported in this POC.)
   pull_request:
     types: [closed, synchronize]
     branches: [main]
-  # Fallback: re-process a finished candidate run by id if its workflow_run event was missed.
+  # Fallback: record a candidate result by hand (e.g. if a build's run was cancelled while
+  # waiting). Leave the input empty to use the queue's current validating candidate.
   workflow_dispatch:
     inputs:
       result_run_id:
-        description: 'Candidate-builder run id or run URL (…/actions/runs/<id>), not the PR or run number'
-        required: true
+        description: 'Optional: candidate-builder run id or URL. Empty = current candidate.'
+        required: false
         type: string
 
 permissions:
@@ -80,12 +80,12 @@ jobs:
         && startsWith(github.event.comment.body, '/queue')
         && !startsWith(github.event.comment.body, '/queue status')
         && github.event.comment.user.type != 'Bot')
-      || github.event_name == 'workflow_run'
-      || github.event_name == 'workflow_dispatch'
       || (github.event_name == 'pull_request'
         && contains(join(github.event.pull_request.labels.*.name, ' '), 'queue:'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    outputs:
+      candidate_id: ${{ steps.update.outputs.candidate_id }}
     # One queue mutation at a time; a running mutation is never cancelled.
     # ponytail: GitHub keeps one pending run per group, so a 3rd command arriving while one runs
     # and one waits replaces the waiting one (it shows as cancelled, with no reaction on the
@@ -100,20 +100,62 @@ jobs:
           sparse-checkout: scripts/poc/queue
           persist-credentials: false
 
-      - name: Download candidate artifacts
-        if: github.event_name == 'workflow_run' || github.event_name == 'workflow_dispatch'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUN_INPUT: ${{ github.event.workflow_run.id || inputs.result_run_id }}
-        run: |
-          # Accept a bare id or a run URL; the queue manager step validates it and explains errors.
-          RUN_ID=$(sed -E 's#.*/runs/##' <<<"$RUN_INPUT" | grep -oE '^[0-9]+' || true)
-          [ -n "$RUN_ID" ] || { echo "Not a run id: $RUN_INPUT"; exit 0; }
-          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/candidate-artifacts" \
-            || echo "No artifacts for run $RUN_ID; the result is derived from the run's steps."
-
       - name: Update queue
+        id: update
         run: node scripts/poc/queue/main.mjs
         env:
           GITHUB_TOKEN: ${{ github.token }}
+
+  # After `/queue build` (or a manual run): wait for the candidate run without holding the lock.
+  await-candidate:
+    needs: manage
+    if: >-
+      !cancelled()
+      && (needs.manage.outputs.candidate_id != '' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    outputs:
+      run_id: ${{ steps.wait.outputs.run_id }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: scripts/poc/queue
+          persist-credentials: false
+      - name: Wait for candidate run
+        id: wait
+        run: node scripts/poc/queue/main.mjs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          QUEUE_MODE: await
+          CANDIDATE_ID: ${{ needs.manage.outputs.candidate_id }}
+          RUN_INPUT: ${{ inputs.result_run_id }}
+
+  record-result:
+    needs: await-candidate
+    if: ${{ !cancelled() && needs.await-candidate.outputs.run_id != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: poc-release-queue
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: scripts/poc/queue
+          persist-credentials: false
+      - name: Download candidate artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ needs.await-candidate.outputs.run_id }}
+        run: |
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/candidate-artifacts" \
+            || echo "No artifacts for run $RUN_ID; the result is derived from the run's steps."
+      - name: Record candidate result
+        run: node scripts/poc/queue/main.mjs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          QUEUE_MODE: record
+          RESULT_RUN_ID: ${{ needs.await-candidate.outputs.run_id }}
           QUEUE_ARTIFACTS_DIR: ${{ runner.temp }}/candidate-artifacts

@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 // POC release queue manager. Handles one GitHub event per run:
 //   issue_comment    `/queue …` commands on PRs or on the queue issue
-//   workflow_run     a finished candidate-builder run (reads its artifacts)
-//   workflow_dispatch  re-process a candidate run by id (fallback for workflow_run)
 //   pull_request     a queued PR was closed/merged or got new commits
+// and two helper modes used by later jobs of the same workflow run:
+//   QUEUE_MODE=await   wait for a candidate-builder run to finish (after /queue build, or on a
+//                      manual run for the current candidate) and output its run id
+//   QUEUE_MODE=record  apply that finished run's result (from its artifacts) to the queue
 // It only changes queue metadata (issue body, labels, comments) and dispatches the existing
 // candidate builder. It never merges, pushes, or changes code.
 import { createHash } from 'node:crypto';
@@ -492,6 +494,8 @@ async function build(ctx, cmd, op, finish, reject) {
     await save(ctx, touched);
     return reject(`Could not dispatch the candidate builder: ${err.message}`);
   }
+  // The await-candidate job picks this up and waits for the run to finish.
+  if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `candidate_id=${id}\n`);
   const runs = `${SERVER}/${process.env.GITHUB_REPOSITORY}/actions/workflows/${CANDIDATE_WORKFLOW}`;
   return finish(
     [
@@ -698,28 +702,91 @@ async function handlePrEvent() {
   summary(renderOperationSummary(ctx.state, op));
 }
 
-/** Manual re-processing: accepts a run id or a run URL (…/actions/runs/<id>[/job/…]). */
-async function handleManualResult(input) {
+// ---- Waiting for a candidate run ----
+// Runs started with GITHUB_TOKEN (our dispatch) do not emit workflow_run events, so the queue
+// manager waits for its own candidate run instead, in a job that holds no queue lock.
+const BUILDER_NAME = 'POC - Build Release Candidate';
+const RUN_HELP =
+  'Use the candidate-builder run id: the number after /actions/runs/ in the URL of a ' +
+  `"${BUILDER_NAME}" run (or paste that URL), or leave it empty for the current candidate.`;
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const POLL_MS = Number(process.env.QUEUE_POLL_SECONDS ?? 20) * 1000;
+const WAIT_LIMIT_MS = 50 * 60 * 1000;
+
+/** Validates a run id or run URL (…/actions/runs/<id>[/job/…]) and returns the run. */
+async function runFromInput(input) {
   const id = /^\d+/.exec(String(input).trim().split('/runs/').at(-1))?.[0];
-  const help =
-    'Use the candidate-builder run id: the number after /actions/runs/ in the URL of a ' +
-    '"POC - Build Release Candidate" run (or paste that URL).';
-  if (!id) throw new Error(`"${input}" is not a run id. ${help}`);
+  if (!id) throw new Error(`"${input}" is not a run id. ${RUN_HELP}`);
   const run = await api('GET', `${REPO}/actions/runs/${id}`, null, { allow404: true });
-  if (!run) throw new Error(`Run ${id} was not found in this repository. ${help}`);
-  if (run.name !== 'POC - Build Release Candidate') {
-    throw new Error(`Run ${id} is a "${run.name}" run, not a candidate-builder run. ${help}`);
+  if (!run) throw new Error(`Run ${id} was not found in this repository. ${RUN_HELP}`);
+  if (run.name !== BUILDER_NAME) {
+    throw new Error(`Run ${id} is a "${run.name}" run, not a candidate-builder run. ${RUN_HELP}`);
   }
-  if (run.status !== 'completed')
-    throw new Error(`Run ${id} has not finished yet (${run.status}).`);
-  await handleResult(run);
+  return run;
+}
+
+/**
+ * Latest candidate-builder run for a candidate id (matched by its run name), or null.
+ * Runs created before `notBefore` are ignored, so an older run reusing the id is never picked.
+ */
+async function findCandidateRun(candidateId, notBefore) {
+  const earliest = notBefore ? Date.parse(notBefore) - 60_000 : 0; // allow for clock skew
+  const { workflow_runs: runs } = await api(
+    'GET',
+    `${REPO}/actions/workflows/${CANDIDATE_WORKFLOW}/runs?event=workflow_dispatch&per_page=30`,
+  );
+  return (
+    runs
+      .filter((r) => r.display_title?.startsWith(`Candidate ${candidateId} (`))
+      .filter((r) => Date.parse(r.created_at) >= earliest)
+      .sort((a, b) => b.created_at.localeCompare(a.created_at))[0] ?? null
+  );
+}
+
+/**
+ * Waits until the candidate run is finished and outputs its id for the job that records it.
+ * Uses RUN_INPUT (id/URL) if given, else CANDIDATE_ID, else the queue's validating candidate.
+ */
+async function awaitCandidate() {
+  const input = process.env.RUN_INPUT?.trim();
+  let candidateId = process.env.CANDIDATE_ID?.trim();
+  const cc = input ? null : (await loadQueue({ create: false }))?.state.current_candidate;
+  if (!input && !candidateId) {
+    if (cc?.status !== 'VALIDATING') {
+      const msg = `No candidate is validating (${cc ? `${cc.id}: ${cc.status}` : 'none'}); nothing to wait for.`;
+      console.log(msg);
+      return summary(`# Candidate Result\n\n${msg}`);
+    }
+    candidateId = cc.id;
+  }
+  const deadline = Date.now() + WAIT_LIMIT_MS;
+  for (;;) {
+    const notBefore = cc?.id === candidateId ? cc.started_at : null;
+    const run = input ? await runFromInput(input) : await findCandidateRun(candidateId, notBefore);
+    if (run?.status === 'completed') {
+      console.log(`Candidate run ${run.id} (${run.display_title}) finished: ${run.conclusion}.`);
+      if (process.env.GITHUB_OUTPUT)
+        appendFileSync(process.env.GITHUB_OUTPUT, `run_id=${run.id}\n`);
+      return;
+    }
+    if (Date.now() > deadline) {
+      throw new Error(`Gave up waiting for candidate ${candidateId ?? input} after 50 minutes.`);
+    }
+    console.log(
+      run
+        ? `Run ${run.id} is ${run.status}; waiting…`
+        : `Waiting for the ${candidateId} run to appear…`,
+    );
+    await sleep(POLL_MS);
+  }
 }
 
 // ---- Entry point ----
 try {
-  if (EVENT === 'issue_comment') await handleComment();
-  else if (EVENT === 'workflow_run') await handleResult(ev.workflow_run);
-  else if (EVENT === 'workflow_dispatch') await handleManualResult(ev.inputs.result_run_id);
+  if (process.env.QUEUE_MODE === 'await') await awaitCandidate();
+  else if (process.env.QUEUE_MODE === 'record')
+    await handleResult(await runFromInput(process.env.RESULT_RUN_ID));
+  else if (EVENT === 'issue_comment') await handleComment();
   else if (EVENT === 'pull_request') await handlePrEvent();
   else console.log(`Unhandled event ${EVENT}.`);
 } catch (err) {
