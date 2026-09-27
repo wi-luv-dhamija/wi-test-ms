@@ -36,7 +36,7 @@ export function DashboardPage() {
                 <div>
                   <div className={styles.itemTitle}>{task.title}</div>
                   <div className={`${styles.itemMeta} muted`}>
-                    {task.assignee} · {formatDate(task.createdAt)}
+                    {task.assignee.name} · {formatDate(task.createdAt)}
                   </div>
                 </div>
                 <StatusBadge status={task.status} />

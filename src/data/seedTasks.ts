@@ -1,4 +1,12 @@
-import type { Task } from '../types/task';
+import type { Assignee, Task } from '../types/task';
+
+const users = {
+  aisha: { id: 'user-1', name: 'Aisha Khan' },
+  rahul: { id: 'user-2', name: 'Rahul Mehta' },
+  priya: { id: 'user-3', name: 'Priya Sharma' },
+  daniel: { id: 'user-4', name: 'Daniel Lee' },
+  sofia: { id: 'user-5', name: 'Sofia Garcia' },
+} satisfies Record<string, Assignee>;
 
 export const seedTasks: Task[] = [
   {
@@ -7,7 +15,7 @@ export const seedTasks: Task[] = [
     description: 'Configure GitHub Actions to lint, test and build on every pull request.',
     status: 'Completed',
     priority: 'High',
-    assignee: 'Aisha Khan',
+    assignee: users.aisha,
     createdAt: '2026-09-01T09:00:00.000Z',
   },
   {
@@ -16,7 +24,7 @@ export const seedTasks: Task[] = [
     description: 'Create wireframes for the dashboard summary cards and recent tasks list.',
     status: 'Completed',
     priority: 'Medium',
-    assignee: 'Rahul Mehta',
+    assignee: users.rahul,
     createdAt: '2026-09-03T10:30:00.000Z',
   },
   {
@@ -25,7 +33,7 @@ export const seedTasks: Task[] = [
     description: 'Research filtering options for the tasks page by status and priority.',
     status: 'In Progress',
     priority: 'Medium',
-    assignee: 'Priya Sharma',
+    assignee: users.priya,
     createdAt: '2026-09-06T08:15:00.000Z',
   },
   {
@@ -34,7 +42,7 @@ export const seedTasks: Task[] = [
     description: 'Document local setup, scripts and contribution workflow for new developers.',
     status: 'In Progress',
     priority: 'Low',
-    assignee: 'Daniel Lee',
+    assignee: users.daniel,
     createdAt: '2026-09-09T14:00:00.000Z',
   },
   {
@@ -43,7 +51,7 @@ export const seedTasks: Task[] = [
     description: 'Navigation links overflow on narrow screens; make the header wrap cleanly.',
     status: 'Pending',
     priority: 'High',
-    assignee: 'Aisha Khan',
+    assignee: users.aisha,
     createdAt: '2026-09-12T11:45:00.000Z',
   },
   {
@@ -52,7 +60,7 @@ export const seedTasks: Task[] = [
     description: 'Check colour contrast, focus states and form labels across all pages.',
     status: 'Pending',
     priority: 'Medium',
-    assignee: 'Sofia Garcia',
+    assignee: users.sofia,
     createdAt: '2026-09-15T16:20:00.000Z',
   },
   {
@@ -61,7 +69,7 @@ export const seedTasks: Task[] = [
     description: 'Summarise changes merged since the last release candidate.',
     status: 'Pending',
     priority: 'Low',
-    assignee: 'Rahul Mehta',
+    assignee: users.rahul,
     createdAt: '2026-09-18T09:10:00.000Z',
   },
   {
@@ -70,7 +78,7 @@ export const seedTasks: Task[] = [
     description: 'Agree on required checks and review rules before enabling the merge queue.',
     status: 'In Progress',
     priority: 'High',
-    assignee: 'Priya Sharma',
+    assignee: users.priya,
     createdAt: '2026-09-21T13:30:00.000Z',
   },
 ];
