@@ -1,0 +1,95 @@
+name: POC - Build Release Candidate
+run-name: Candidate ${{ inputs.candidate_id }} (PRs ${{ inputs.prs }})
+
+# Combines the latest main with an ordered list of PRs, validating each cumulative state:
+#   main + A, main + A + B, main + A + B + C
+# Read-only: nothing is merged, pushed, tagged or deployed. Output is a candidate manifest.
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_id:
+        description: 'Candidate ID (letters, digits, . _ -), e.g. poc-001'
+        required: true
+        type: string
+      prs:
+        description: 'Ordered comma-separated PR numbers, e.g. 12,15,18'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  build-candidate:
+    name: Build candidate ${{ inputs.candidate_id }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # Inputs reach scripts only through env, never interpolated into shell code.
+      CANDIDATE_ID: ${{ inputs.candidate_id }}
+      PRS_INPUT: ${{ inputs.prs }}
+    steps:
+      - name: Checkout latest main
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Capture baseline
+        run: |
+          mkdir -p "$RUNNER_TEMP/poc-state"
+          # Run scripts from a copy so merged PRs can't swap them out mid-run.
+          cp -R scripts/poc "$RUNNER_TEMP/poc-scripts"
+          base_sha=$(git rev-parse HEAD)
+          base_tree=$(git rev-parse 'HEAD^{tree}')
+          echo "BASE_MAIN_SHA=$base_sha" >> "$GITHUB_ENV"
+          echo "BASE_MAIN_TREE_SHA=$base_tree" >> "$GITHUB_ENV"
+          echo "Candidate: $CANDIDATE_ID"
+          echo "Base main: $base_sha"
+          echo "Base tree: $base_tree"
+          echo "PRs: $PRS_INPUT"
+
+      - name: Validate PR input
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: '"$RUNNER_TEMP/poc-scripts/validate-prs.sh"'
+
+      - name: Fetch PR snapshots
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: '"$RUNNER_TEMP/poc-scripts/fetch-snapshots.sh"'
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+
+      # Runs untrusted PR code: no token or secrets in this step's environment.
+      - name: Assemble and validate candidate
+        run: '"$RUNNER_TEMP/poc-scripts/build-candidate.sh"'
+
+      - name: Check for stale PRs or main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: '"$RUNNER_TEMP/poc-scripts/check-staleness.sh"'
+
+      - name: Create candidate manifest
+        run: '"$RUNNER_TEMP/poc-scripts/create-manifest.sh"'
+
+      - name: Upload candidate manifest
+        uses: actions/upload-artifact@v7
+        with:
+          name: candidate-manifest-${{ inputs.candidate_id }}
+          path: ${{ runner.temp }}/poc-state/candidate-manifest.json
+          if-no-files-found: error
+
+      - name: Write job summary
+        if: always()
+        run: |
+          if [ -x "$RUNNER_TEMP/poc-scripts/write-summary.sh" ]; then
+            "$RUNNER_TEMP/poc-scripts/write-summary.sh"
+          else
+            echo "## Candidate $CANDIDATE_ID - FAILED (before setup; see logs)" >> "$GITHUB_STEP_SUMMARY"
+          fi

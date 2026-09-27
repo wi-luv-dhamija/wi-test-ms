@@ -1,0 +1,23 @@
+.badge {
+  display: inline-block;
+  padding: 0.15rem 0.6rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.pending {
+  color: var(--color-pending);
+  background: var(--color-pending-bg);
+}
+
+.inProgress {
+  color: var(--color-progress);
+  background: var(--color-progress-bg);
+}
+
+.completed {
+  color: var(--color-completed);
+  background: var(--color-completed-bg);
+}
