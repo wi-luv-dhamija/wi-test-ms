@@ -49,8 +49,20 @@ export function interaction(detail, failing) {
   return peers.length ? peers.map((n) => `#${n} ↔ #${failing}`).join(', ') : null;
 }
 
+/** "alice (#1, #3), bob (#2)": one entry per person. */
+function collaboratorList(collaborators, mention) {
+  const byAuthor = new Map();
+  for (const c of collaborators)
+    byAuthor.set(c.author, [...(byAuthor.get(c.author) ?? []), c.number]);
+  return [...byAuthor]
+    .map(
+      ([author, prs]) => `${mention ? '@' : ''}${author} (${prs.map((n) => `#${n}`).join(', ')})`,
+    )
+    .join(', ');
+}
+
 /** Bullet lines describing a TEST_FAILED / MERGE_CONFLICT detail. */
-function detailLines(detail, failing) {
+function detailLines(detail, failing, { mention = true } = {}) {
   if (!detail) return [];
   const lines = [];
   if (detail.type === 'TEST_FAILED') {
@@ -76,36 +88,8 @@ function detailLines(detail, failing) {
     if (overlap.length) lines.push(`- Earlier PRs touching these files: ${overlap.join(', ')}`);
   }
   if (detail.collaborators?.length) {
-    lines.push(
-      `- Suggested collaborators: ${detail.collaborators.map((c) => `@${c.author} (#${c.number})`).join(', ')}`,
-    );
+    lines.push(`- Suggested collaborators: ${collaboratorList(detail.collaborators, mention)}`);
   }
-  return lines;
-}
-
-function candidateLines(cc) {
-  if (!cc) return ['_No candidate has been built yet._'];
-  const lines = [
-    `**${cc.id}** — ${badge(cc.status) ?? cc.status} · ${queueLine(cc.prs.map((number) => ({ number })))}`,
-  ];
-  lines.push(
-    '',
-    `Queue revision ${cc.revision ?? '—'} · started ${time(cc.started_at)}${cc.reason ? ` (${cell(cc.reason)})` : ''}${cc.finished_at ? ` · finished ${time(cc.finished_at)}` : ''}${cc.run_url ? ` · [run](${cc.run_url})` : ''}`,
-  );
-  if (cc.status === 'VALIDATED') {
-    lines.push(
-      '',
-      `Candidate SHA: ${short(cc.candidate_sha)} · tree ${short(cc.candidate_tree_sha)} · base main ${short(cc.base_main_sha)}`,
-    );
-  }
-  if (cc.first_failing_pr) {
-    const rest = cc.prs.slice(cc.prs.indexOf(cc.first_failing_pr) + 1);
-    lines.push(
-      '',
-      `First failing addition: **#${cc.first_failing_pr}** (${cc.status}) · validated prefix: ${refs(cc.passed_prs) || 'none'} · not run: ${refs(rest) || 'none'}`,
-    );
-  }
-  if (cc.note) lines.push('', `Note: ${cc.note}`);
   return lines;
 }
 
@@ -136,6 +120,73 @@ function validationLines(cc) {
   });
 }
 
+// ---- Dashboard: plain words first, details folded away ----
+const STATUS_WORDS = {
+  QUEUED: '⏳ Waiting for check',
+  VALIDATING: '🔄 Being checked',
+  VALIDATED: '✅ Ready',
+};
+/** Dashboard text must not @-mention people: it is rewritten on every queue change. */
+const noPing = (text) => cell(text).replaceAll('@', '');
+const list = (numbers) => numbers.map((n) => `#${n}`).join(', ');
+const peersOf = (e) => {
+  const d = e.result_detail;
+  const others = d?.type === 'MERGE_CONFLICT' ? d.direct_conflicts_with : d?.related_prs;
+  return (others ?? []).filter((n) => n !== e.number);
+};
+
+/** What went wrong, in one short sentence. */
+function problem(e) {
+  const peers = peersOf(e);
+  const withPeers = peers.length ? ` with ${list(peers)}` : '';
+  switch (e.state) {
+    case 'TEST_FAILED':
+      return `Tests fail${peers.length ? ` when combined with ${list(peers)}` : ''}`;
+    case 'MERGE_CONFLICT': {
+      const files = e.result_detail?.conflicting_files ?? [];
+      return `Merge conflict${withPeers}${files.length ? ` in ${files.map((f) => `\`${f.split('/').pop()}\``).join(', ')}` : ''}`;
+    }
+    case 'STALE_PR':
+      return 'New commits were pushed';
+    default:
+      return cell(e.state_reason ?? 'Needs attention');
+  }
+}
+const NEXT_STEP = {
+  TEST_FAILED: 'Fix it, push, then comment `/queue retry`',
+  MERGE_CONFLICT: 'Resolve the conflict, push, then comment `/queue retry`',
+  STALE_PR: 'Comment `/queue retry` to check the new commits',
+  BLOCKED: 'Fix it, then comment `/queue retry`',
+};
+
+function headline(state, queued, ejected) {
+  const prs = list(queued.map((e) => e.number));
+  let line;
+  if (!queued.length) {
+    line = 'The queue is empty. Comment `/queue add` on a pull request to join.';
+  } else if (queued.some((e) => e.state === 'VALIDATING')) {
+    line = `🔄 **Checking ${prs} together…**`;
+  } else if (queued.every((e) => e.state === 'VALIDATED')) {
+    line = `✅ **${prs} ${queued.length > 1 ? 'pass together and are' : 'passes and is'} ready to release.**`;
+  } else {
+    line = `⏳ **The queue changed.** A new check of ${prs} starts in a moment.`;
+  }
+  if (ejected.length) {
+    line += ` ${ejected.length} PR${ejected.length > 1 ? 's need' : ' needs'} attention below.`;
+  }
+  return line;
+}
+
+const details = (title, lines) => [
+  '<details>',
+  `<summary>${title}</summary>`,
+  '',
+  ...lines,
+  '',
+  '</details>',
+  '',
+];
+
 export function renderDashboard(state, meta = {}) {
   const queued = queueEntries(state);
   const ejected = state.entries.filter((e) => EJECTED.has(e.state));
@@ -145,94 +196,122 @@ export function renderDashboard(state, meta = {}) {
     .filter((e) => INACTIVE.has(e.state))
     .slice(-10)
     .reverse();
-  const md = [`# ${QUEUE_TITLE}`, ''];
-  md.push(
-    '> Managed by the **POC Queue Manager** workflow. The queue revalidates itself whenever it or `main` changes. Comment `/queue …` commands on this issue or on a PR. Do not edit this description by hand: the queue state is stored in it.',
-    '',
-  );
-  md.push(
-    `**Queue status:** ${state.frozen ? `🧊 FROZEN (by @${state.frozen_by}, ${time(state.frozen_at)})` : '🟢 OPEN'} · revision ${state.revision}`,
-    '',
-  );
-  md.push(`**Last updated:** ${time(meta.now ?? new Date().toISOString())}`, '');
+  const cc = state.current_candidate;
 
-  md.push('## Current candidate', '', ...candidateLines(state.current_candidate), '');
+  const md = [`# 🚦 ${QUEUE_TITLE}`, ''];
+  if (state.frozen) {
+    md.push(`> 🧊 **The queue is frozen**: no PR can join until \`/queue unfreeze\`.`, '');
+  }
+  md.push(headline(state, queued, ejected), '');
+  md.push(
+    `<sub>Updated ${time(meta.now ?? new Date().toISOString())}${cc?.run_url ? ` · [latest check (${cc.id})](${cc.run_url})` : ''} · the queue re-checks itself whenever it or \`main\` changes</sub>`,
+    '',
+  );
 
   md.push('## Queue', '');
   if (queued.length) {
-    md.push(
-      '| Pos | PR | Title | Author | Head SHA | State | Last result |',
-      '|---|---|---|---|---|---|---|',
-    );
-    queued.forEach((e, i) => {
-      const last = e.last_result
-        ? `${e.last_result}${e.last_candidate ? ` (${e.last_candidate})` : ''}`
-        : 'waiting';
+    md.push('| # | Pull request | Status |', '|---|---|---|');
+    queued.forEach((e, i) =>
       md.push(
-        `| ${i + 1} | #${e.number} | ${cell(e.title)} | @${e.author} | ${short(e.head_sha)}${revision(e)} | ${badge(e.state)} | ${cell(last)} |`,
-      );
-    });
+        `| ${i + 1} | #${e.number} | ${STATUS_WORDS[e.state]}${e.new_revision ? ' · 🆕 new commits' : ''} |`,
+      ),
+    );
   } else {
-    md.push('_The queue is empty._');
+    md.push('_Empty._');
   }
   md.push('');
 
   if (ejected.length) {
     md.push(
-      '## Ejected — needs action',
+      '## ❌ Needs attention',
       '',
-      'These PRs are out of the queue and are not validated until re-entered: `/queue retry` returns a PR to its previous place, `/queue add` puts it at the end, `/queue remove` drops it.',
+      '_These PRs were taken out of the queue so the others can still ship._',
       '',
     );
+    md.push('| Pull request | Problem | What to do |', '|---|---|---|');
+    for (const e of ejected)
+      md.push(`| #${e.number} | ${problem(e)} | ${NEXT_STEP[e.state] ?? NEXT_STEP.BLOCKED} |`);
+    md.push('');
     for (const e of ejected) {
+      if (!e.result_detail && !e.failure) continue;
+      const f = e.failure;
       md.push(
-        `**#${e.number} ${cell(e.title)}** (@${e.author}) — ${badge(e.state)}${e.state_reason ? ` (${e.state_reason})` : ''} · ${short(e.head_sha)}${revision(e)}`,
+        ...details(`Why #${e.number} was taken out`, [
+          ...(f
+            ? [
+                `Checked in ${f.candidate}: ${list(f.passed_prs) || 'nothing'} passed, then adding #${e.number} failed (${f.status}).`,
+                '',
+              ]
+            : []),
+          ...detailLines(e.result_detail, e.number, { mention: false }),
+          '',
+          'This is a hint, not a verdict: the cause may be this PR or how it combines with the others.',
+        ]),
       );
-      md.push(...detailLines(e.result_detail, e.number), '');
     }
   }
 
   if (held.length) {
-    md.push('## Held', '', '| PR | Title | Author | Head SHA | Since |', '|---|---|---|---|---|');
-    for (const e of held)
-      md.push(
-        `| #${e.number} | ${cell(e.title)} | @${e.author} | ${short(e.head_sha)} | ${time(e.updated_at)} |`,
-      );
-    md.push('');
+    md.push(
+      '## ⏸️ On hold',
+      '',
+      `${list(held.map((e) => e.number))} — not included in checks. \`/queue resume\` brings a PR back.`,
+      '',
+    );
   }
   if (ready.length) {
     md.push(
-      '## Waiting for unfreeze',
+      '## ⏳ Waiting for unfreeze',
       '',
-      'These PRs asked to join while the queue was frozen and will be queued on `/queue unfreeze`.',
+      `${list(ready.map((e) => e.number))} will join when the queue is unfrozen.`,
       '',
     );
-    for (const e of ready)
-      md.push(`- #${e.number} ${cell(e.title)} (@${e.author}) ${short(e.head_sha)}`);
-    md.push('');
   }
+
+  const technical = [];
+  if (cc) {
+    technical.push(
+      `- Latest check: **${cc.id}** — ${badge(cc.status)} · ${queueLine(cc.prs.map((number) => ({ number })))} · started ${time(cc.started_at)}${cc.finished_at ? `, finished ${time(cc.finished_at)}` : ''}${cc.reason ? ` · reason: ${noPing(cc.reason)}` : ''}`,
+    );
+    if (cc.status === 'VALIDATED') {
+      technical.push(
+        `- Candidate SHA ${short(cc.candidate_sha)} · tree ${short(cc.candidate_tree_sha)} · base main ${short(cc.base_main_sha)}`,
+      );
+    }
+    if (cc.note) technical.push(`- Note: ${cell(cc.note)}`);
+  }
+  technical.push(`- Queue revision ${state.revision}`);
+  for (const e of [...queued, ...ejected, ...held, ...ready]) {
+    technical.push(
+      `- #${e.number}: ${e.author} · head ${short(e.head_sha)}${revision(e)} · ${badge(e.state)}${e.last_result ? ` · last result ${cell(e.last_result)}${e.last_candidate ? ` (${e.last_candidate})` : ''}` : ''}`,
+    );
+  }
+  md.push(...details('Technical details', technical));
   if (inactive.length) {
-    md.push('## Recently removed or merged', '');
-    for (const e of inactive)
-      md.push(`- #${e.number} ${cell(e.title)} — ${badge(e.state)} ${time(e.updated_at)}`);
-    md.push('');
+    md.push(
+      ...details(
+        'Recently removed or merged',
+        inactive.map((e) => `- #${e.number} — ${badge(e.state)} ${time(e.updated_at)}`),
+      ),
+    );
   }
   if (state.history.length) {
-    md.push('<details><summary>Recent activity</summary>', '');
-    for (const h of state.history)
-      md.push(
-        `- ${time(h.at)} — ${h.op}${h.pr ? ` #${h.pr}` : ''} by @${h.by}${h.detail ? `: ${cell(h.detail)}` : ''}`,
-      );
-    md.push('', '</details>', '');
+    md.push(
+      ...details(
+        'Recent activity',
+        state.history.map(
+          (h) =>
+            `- ${time(h.at)} — ${h.op}${h.pr ? ` #${h.pr}` : ''} by ${h.by}${h.detail ? `: ${noPing(h.detail)}` : ''}`,
+        ),
+      ),
+    );
   }
-  md.push('## Available commands', '');
   md.push(
-    'On a PR: `/queue add` · `/queue remove` · `/queue hold` · `/queue resume` · `/queue retry` · `/queue status`',
-    '',
-  );
-  md.push(
-    'On this issue: `/queue status` · `/queue revalidate` · `/queue freeze` · `/queue unfreeze` · `/queue move #PR POS` · `/queue hold #PR` (and the other PR commands with `#PR`)',
-    '',
+    ...details('Commands', [
+      '**On a pull request:** `/queue add` join · `/queue remove` leave · `/queue hold` pause · `/queue resume` un-pause · `/queue retry` re-check after a fix · `/queue status`',
+      '',
+      '**On this issue:** `/queue status` · `/queue revalidate` re-check now · `/queue freeze` / `/queue unfreeze` · `/queue move #PR POS` · any PR command with `#PR`, e.g. `/queue hold #3`',
+    ]),
   );
   md.push(serializeState(state));
   return md.join('\n') + '\n';

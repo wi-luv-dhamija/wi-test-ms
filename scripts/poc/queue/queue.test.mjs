@@ -222,7 +222,8 @@ describe('rendering', () => {
       },
     });
     const md = renderDashboard(state);
-    expect(md).toContain('## Ejected — needs action');
+    expect(md).toContain('## ❌ Needs attention');
+    expect(md).toContain('| #3 | Tests fail when combined with #1 |');
     expect(md).toContain('#1 ↔ #3');
     expect(md).not.toContain('/queue build');
     expect(parseState(md)).toEqual(state);
