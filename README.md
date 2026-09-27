@@ -50,9 +50,28 @@ If every state passes and neither `main` nor any selected PR moved during the ru
 `candidate-manifest.json` as the artifact `candidate-manifest-<candidate_id>`. The logic lives in
 `scripts/poc/`.
 
+### Test-failure diagnosis
+
+When a cumulative state fails with `TEST_FAILED`, the workflow reads Vitest's JSON report and
+adds a diagnosis to the job summary:
+
+- the failed test files, test names, errors and first stack trace;
+- which selected PRs are likely related. An earlier PR counts only if it changed the failing test
+  file or the file where the error was thrown. PRs that changed other files on the stack trace
+  are listed as a weaker signal;
+- heuristic hints (`DATA_MODEL_OR_CONTRACT_CHANGE`, `BEHAVIOR_OR_UI_CHANGE`, `SHARED_FILE_CHANGE`,
+  `SHARED_MODULE_CHANGE` or `UNKNOWN`) and suggested collaborators (the related PRs' authors).
+
+It never names a root cause and never changes code. It uploads `vitest-report.json` and
+`candidate-test-diagnosis.json` as the artifact `candidate-diagnosis-<candidate_id>`. Failure
+types are `MERGE_CONFLICT`, `MERGE_FAILED`, `INSTALL_FAILED`, `LINT_FAILED`, `TEST_FAILED`,
+`BUILD_FAILED`, `STALE_PR` and `STALE_MAIN`.
+
 ### Triggering it
 
-The workflow file must be on `main` before GitHub shows it.
+The workflow file must be on `main` before GitHub shows it. The candidate always starts from
+`main`, but the scripts in `scripts/poc/` come from the branch picked in **Use workflow from**, so
+changes to the tooling can be tried from a branch before they are merged.
 
 1. Go to **Actions → POC - Build Release Candidate → Run workflow**.
 2. Enter `candidate_id` (e.g. `poc-001`) and `prs` as an ordered list (e.g. `12,15,18`).

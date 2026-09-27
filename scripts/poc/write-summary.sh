@@ -4,7 +4,8 @@
 set -uo pipefail
 
 state="$RUNNER_TEMP/poc-state"
-STATUS="" FAILURE_TYPE="" FAILED_PR="" FAILED_PR_TITLE="" PASSED_PRS="" CANDIDATE_SHA="" CANDIDATE_TREE_SHA=""
+STATUS="" FAILURE_TYPE="" FAILED_PR="" FAILED_PR_TITLE="" PASSED_PRS="" FAILED_COMBINATION=""
+CANDIDATE_SHA="" CANDIDATE_TREE_SHA=""
 # shellcheck source=/dev/null
 [[ -f "$state/result.env" ]] && source "$state/result.env"
 STATUS=${STATUS:-FAILED}
@@ -20,6 +21,7 @@ STATUS=${STATUS:-FAILED}
   echo
   echo "**Requested PRs:** \`$PRS_INPUT\`"
   echo
+  [[ -n "$FAILURE_TYPE" ]] && echo "**Failure type:** $FAILURE_TYPE" && echo
 
   if [[ -f "$state/errors.txt" ]]; then
     echo "### Input validation failed - candidate was not created"
@@ -31,14 +33,16 @@ STATUS=${STATUS:-FAILED}
   if [[ -f "$state/prs.json" ]]; then
     echo "### Selected PRs"
     echo
-    echo "| | PR | Title | Branch | Head SHA |"
-    echo "|---|---|---|---|---|"
-    jq -r '.[] | "\(.number)\t\(.title)\t\(.branch)\t\(.head_sha)"' "$state/prs.json" |
-      while IFS=$'\t' read -r number title branch sha; do
-        icon="⏸️"
-        [[ ",$PASSED_PRS," == *",#$number,"* || "$STATUS" =~ ^(VALIDATED|STALE)$ ]] && icon="✅"
-        [[ "$number" == "$FAILED_PR" ]] && icon="❌"
-        echo "| $icon | #$number | ${title//|/\\|} | \`$branch\` | \`${sha:0:12}\` |"
+    echo "| | PR | Title | Author | Head SHA | Candidate state |"
+    echo "|---|---|---|---|---|---|"
+    jq -r '.[] | "\(.number)\t\(.title)\t\(.author // "unknown")\t\(.head_sha)"' "$state/prs.json" |
+      while IFS=$'\t' read -r number title author sha; do
+        icon="⏸️" result="NOT RUN"
+        if [[ ",$PASSED_PRS," == *",#$number,"* || "$STATUS" =~ ^(VALIDATED|STALE)$ ]]; then
+          icon="✅" result="PASS"
+        fi
+        [[ "$number" == "$FAILED_PR" ]] && icon="❌" result="FIRST FAILING ADDITION"
+        echo "| $icon | #$number | ${title//|/\\|} | @$author | \`${sha:0:12}\` | $result |"
       done
     echo
   fi
@@ -62,14 +66,20 @@ STATUS=${STATUS:-FAILED}
       ;;
     FAILED)
       if [[ -n "$FAILED_PR" ]]; then
-        echo "**First failing addition:** PR #$FAILED_PR - $FAILED_PR_TITLE"
-        echo
-        echo "**Failure:** $FAILURE_TYPE"
+        echo "**First failing addition:** #$FAILED_PR - $FAILED_PR_TITLE"
         echo
         echo "**Passed combination:** ${PASSED_PRS:-none}"
         echo
+        echo "**Failed combination:** $FAILED_COMBINATION"
+        echo
         echo "PR #$FAILED_PR is the first addition after which the combined candidate failed." \
-          "The cause may be the PR itself or an interaction with the PRs merged before it."
+          "The root cause may be PR #$FAILED_PR itself or an interaction with earlier PRs."
+        echo
+        if [[ -f "$state/test-diagnosis.md" ]]; then
+          cat "$state/test-diagnosis.md"
+          echo
+          echo "Diagnosis artifacts: \`candidate-diagnosis-$CANDIDATE_ID\`"
+        fi
       else
         echo "**Status:** FAILED — the workflow stopped unexpectedly; see the step logs."
       fi

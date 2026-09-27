@@ -40,9 +40,13 @@ report_failure() { # <pr number> <pr title>
   passed_csv=$(IFS=,; echo "${passed[*]:-}")
   {
     echo "STATUS=FAILED"
-    printf 'FAILURE_TYPE=%q\nFAILED_PR=%q\nFAILED_PR_TITLE=%q\nPASSED_PRS=%q\n' \
-      "$failure" "$1" "$2" "$passed_csv"
+    printf 'FAILURE_TYPE=%q\nFAILED_PR=%q\nFAILED_PR_TITLE=%q\nPASSED_PRS=%q\nFAILED_COMBINATION=%q\n' \
+      "$failure" "$1" "$2" "$passed_csv" "${passed_csv:+$passed_csv,}#$1"
   } >>"$state/result.env"
+  # Machine-readable copy for the test-failure diagnosis.
+  jq -n --arg type "$failure" --argjson pr "$1" --arg passed "$passed_csv" \
+    '{failure_type: $type, failed_pr: $pr, passed_prs: ($passed | [scan("[0-9]+") | tonumber])}' \
+    >"$state/failure.json"
   echo
   echo "CANDIDATE FAILED"
   echo
@@ -51,6 +55,9 @@ report_failure() { # <pr number> <pr title>
   echo
   echo "Passed combination:"
   echo "${passed_csv:-(none — failed on the first PR)}"
+  echo
+  echo "Failed combination:"
+  echo "${passed_csv:+$passed_csv,}#$1"
   echo
   echo "Failure introduced while adding:"
   echo "#$1 - $2"
@@ -92,9 +99,12 @@ for ((i = 0; i < total; i++)); do
     report_failure "$number" "$title"
   fi
 
+  # The JSON report is overwritten per state, so it always describes the latest test run.
+  rm -f "$state/vitest-report.json"
   if run_check INSTALL INSTALL_FAILED npm ci &&
     run_check LINT LINT_FAILED npm run lint &&
-    run_check TEST TEST_FAILED npm run test &&
+    run_check TEST TEST_FAILED npm run test -- --reporter=default --reporter=json \
+      --outputFile.json="$state/vitest-report.json" &&
     run_check BUILD BUILD_FAILED npm run build; then
     passed+=("#$number")
     printf '%s\tPASS\n' "$label" >>"$state/steps.tsv"

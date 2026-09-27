@@ -3,7 +3,8 @@ run-name: Candidate ${{ inputs.candidate_id }} (PRs ${{ inputs.prs }})
 
 # Combines the latest main with an ordered list of PRs, validating each cumulative state:
 #   main + A, main + A + B, main + A + B + C
-# Read-only: nothing is merged, pushed, tagged or deployed. Output is a candidate manifest.
+# Read-only: nothing is merged, pushed, tagged or deployed. Output is a candidate manifest, or
+# on TEST_FAILED a diagnosis report (failed tests, likely related PRs, suggested collaborators).
 on:
   workflow_dispatch:
     inputs:
@@ -40,8 +41,11 @@ jobs:
       - name: Capture baseline
         run: |
           mkdir -p "$RUNNER_TEMP/poc-state"
-          # Run scripts from a copy so merged PRs can't swap them out mid-run.
-          cp -R scripts/poc "$RUNNER_TEMP/poc-scripts"
+          # Scripts come from the ref this run was dispatched from (so tooling changes can be
+          # tried from a branch), copied out so merged PRs can't swap them mid-run.
+          # The candidate itself always starts from main.
+          mkdir -p "$RUNNER_TEMP/poc-scripts"
+          git archive "$GITHUB_SHA" scripts/poc | tar -x -C "$RUNNER_TEMP/poc-scripts" --strip-components=2
           base_sha=$(git rev-parse HEAD)
           base_tree=$(git rev-parse 'HEAD^{tree}')
           echo "BASE_MAIN_SHA=$base_sha" >> "$GITHUB_ENV"
@@ -84,6 +88,21 @@ jobs:
           name: candidate-manifest-${{ inputs.candidate_id }}
           path: ${{ runner.temp }}/poc-state/candidate-manifest.json
           if-no-files-found: error
+
+      - name: Diagnose test failure
+        id: diagnose
+        if: failure()
+        run: node "$RUNNER_TEMP/poc-scripts/diagnose-test-failure.mjs"
+
+      - name: Upload test diagnosis
+        if: failure() && steps.diagnose.outputs.diagnosed == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: candidate-diagnosis-${{ inputs.candidate_id }}
+          path: |
+            ${{ runner.temp }}/poc-state/vitest-report.json
+            ${{ runner.temp }}/poc-state/candidate-test-diagnosis.json
+          if-no-files-found: ignore
 
       - name: Write job summary
         if: always()

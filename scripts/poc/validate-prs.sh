@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Step 2: validate the dispatch inputs and snapshot each PR (number, title, branch, head SHA)
+# Step 2: validate the dispatch inputs and snapshot each PR (number, title, author, branch,
+# head SHA, changed files)
 # into $RUNNER_TEMP/poc-state/prs.json. Fails before any merge if anything is invalid.
 # Env: CANDIDATE_ID, PRS_INPUT, GITHUB_REPOSITORY, GH_TOKEN, RUNNER_TEMP
 set -euo pipefail
@@ -49,10 +50,13 @@ for n in "${numbers[@]}"; do
   fi
   [[ "$base" != main ]] && errors+=("PR #$n targets branch \"$base\" instead of \"main\".")
   [[ "$(jq -r .draft <<<"$pr")" == true ]] && errors+=("PR #$n is a draft.")
-  jq -c '{number, title, branch: .head.ref, head_sha: .head.sha}' <<<"$pr" >>"$state/prs.jsonl"
+  files=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$n/files" --jq '.[].filename' | jq -Rsc 'split("\n") | map(select(length > 0))')
+  jq -c --argjson files "$files" \
+    '{number, title, author: .user.login, branch: .head.ref, head_sha: .head.sha, files: $files}' \
+    <<<"$pr" >>"$state/prs.jsonl"
 done
 fail_if_errors
 
 jq -s . "$state/prs.jsonl" >"$state/prs.json"
 echo "Validated ${#numbers[@]} PR(s), in merge order:"
-jq -r '.[] | "PR #\(.number)  head_sha: \(.head_sha)  branch: \(.branch)  title: \(.title)"' "$state/prs.json"
+jq -r '.[] | "PR #\(.number)  head_sha: \(.head_sha)  branch: \(.branch)  author: @\(.author)  files: \(.files | length)  title: \(.title)"' "$state/prs.json"

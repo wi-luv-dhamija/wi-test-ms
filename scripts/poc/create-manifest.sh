@@ -24,7 +24,7 @@ jq -n \
     base_main_tree_sha: $base_main_tree_sha,
     candidate_sha: $candidate_sha,
     candidate_tree_sha: $candidate_tree_sha,
-    prs: $prs[0],
+    prs: ($prs[0] | map({number, title, author, branch, head_sha})),
     created_at: $created_at,
     workflow_run_id: $workflow_run_id,
     repository: $repository
