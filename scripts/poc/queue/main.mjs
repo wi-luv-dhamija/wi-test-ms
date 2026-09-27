@@ -719,8 +719,9 @@ async function runFromInput(input) {
   if (!id) throw new Error(`"${input}" is not a run id. ${RUN_HELP}`);
   const run = await api('GET', `${REPO}/actions/runs/${id}`, null, { allow404: true });
   if (!run) throw new Error(`Run ${id} was not found in this repository. ${RUN_HELP}`);
-  if (run.name !== BUILDER_NAME) {
-    throw new Error(`Run ${id} is a "${run.name}" run, not a candidate-builder run. ${RUN_HELP}`);
+  // `run.name` is the run's display name when the workflow sets run-name; `path` identifies it.
+  if (run.path?.split('@')[0] !== `.github/workflows/${CANDIDATE_WORKFLOW}`) {
+    throw new Error(`Run ${id} is not a "${BUILDER_NAME}" run (${run.path}). ${RUN_HELP}`);
   }
   return run;
 }
@@ -761,7 +762,7 @@ async function awaitCandidate() {
   }
   const deadline = Date.now() + WAIT_LIMIT_MS;
   for (;;) {
-    const notBefore = cc?.id === candidateId ? cc.started_at : null;
+    const notBefore = cc && cc.id === candidateId ? cc.started_at : null;
     const run = input ? await runFromInput(input) : await findCandidateRun(candidateId, notBefore);
     if (run?.status === 'completed') {
       console.log(`Candidate run ${run.id} (${run.display_title}) finished: ${run.conclusion}.`);
