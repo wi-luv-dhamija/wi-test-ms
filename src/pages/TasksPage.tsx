@@ -19,7 +19,7 @@ export function TasksPage() {
     setEditing(null);
   };
 
-  return (
+  const controls = (
     <>
       <div className="page-header">
         <h1>Tasks</h1>
@@ -55,11 +55,24 @@ export function TasksPage() {
           onCancel={closeForm}
         />
       )}
+    </>
+  );
 
-      {allTasks.length === 0 ? (
-        <p className="muted">No tasks yet. Add one to get started.</p>
-      ) : tasks.length === 0 ? (
+  if (allTasks.length > 0 && tasks.length === 0) {
+    return (
+      <>
+        {controls}
         <p className="muted">No tasks found for this priority.</p>
+      </>
+    );
+  }
+
+  return (
+    <>
+      {controls}
+
+      {tasks.length === 0 ? (
+        <p className="muted">No tasks yet. Add one to get started.</p>
       ) : (
         <div className={styles.grid}>
           {tasks.map((task) => (
