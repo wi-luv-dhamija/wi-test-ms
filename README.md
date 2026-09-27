@@ -77,6 +77,29 @@ base SHA and PR head SHAs, so nothing is checked out or pushed. The summary ends
 collaborators and resolution steps, and `candidate-merge-diagnosis.json` is uploaded with the
 diagnosis artifact.
 
+### Release queue manager
+
+`.github/workflows/poc-queue-manager.yml` (**POC - Queue Manager**) is a developer-facing queue
+on top of the candidate builder. It only orchestrates and reports: it never merges, pushes,
+creates branches or changes code.
+
+- **Commands:** comment on a PR with `/queue add`, `remove`, `hold`, `resume`, `retry` or
+  `status`. On the **POC Release Queue** issue, comment `/queue status`, `build [rc-id]`,
+  `freeze`, `unfreeze` or `move #PR POS`. The PR commands also work there as `/queue hold #PR`.
+  Changing the queue needs write access; anyone can use `status`.
+- **Visibility:** each PR gets one `queue:*` state label and one status comment that is updated
+  in place. The issue shows the active queue (position, author, head SHA, state), the current
+  candidate, blockers with their diagnosis, held PRs, and what `/queue build` would include.
+- **State:** stored as JSON inside the issue description, so don't edit that by hand. Commands
+  that change the queue run one at a time.
+- **Build and results:** `/queue build` marks the active PRs `VALIDATING` and dispatches the
+  candidate builder with `prs` in queue order. When that run finishes, its artifacts (manifest
+  or diagnosis) update the labels, comments and dashboard. The first failing addition becomes
+  `TEST_FAILED`, `MERGE_CONFLICT` or `BLOCKED`, the passing PRs before it become `VALIDATED`,
+  and the queue suggests a next candidate but never drops a PR on its own.
+- **Workflow file on `main`:** the comment and workflow-run triggers only use the version on
+  `main`.
+
 ### Triggering it
 
 The workflow file must be on `main` before GitHub shows it. The candidate always starts from

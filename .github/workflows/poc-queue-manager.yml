@@ -1,0 +1,116 @@
+name: POC - Queue Manager
+run-name: >-
+  ${{
+    github.event_name == 'workflow_run' && format('Queue • RESULT • {0} • {1}',
+      github.event.workflow_run.display_title,
+      github.event.workflow_run.conclusion == 'success' && 'VALIDATED' || github.event.workflow_run.conclusion)
+    || github.event_name == 'workflow_dispatch' && format('Queue • RESULT • run {0}', inputs.result_run_id)
+    || github.event_name == 'pull_request' && format('Queue • PR {0} • #{1}', github.event.action, github.event.pull_request.number)
+    || startsWith(github.event.comment.body, '/queue') && format('Queue • {0} • #{1} • @{2}',
+      startsWith(github.event.comment.body, '/queue add') && 'ADD'
+      || startsWith(github.event.comment.body, '/queue remove') && 'REMOVE'
+      || startsWith(github.event.comment.body, '/queue hold') && 'HOLD'
+      || startsWith(github.event.comment.body, '/queue resume') && 'RESUME'
+      || startsWith(github.event.comment.body, '/queue retry') && 'RETRY'
+      || startsWith(github.event.comment.body, '/queue status') && 'STATUS'
+      || startsWith(github.event.comment.body, '/queue move') && 'MOVE'
+      || startsWith(github.event.comment.body, '/queue build') && 'BUILD'
+      || startsWith(github.event.comment.body, '/queue freeze') && 'FREEZE'
+      || startsWith(github.event.comment.body, '/queue unfreeze') && 'UNFREEZE'
+      || 'COMMAND',
+      github.event.issue.number, github.event.comment.user.login)
+    || 'Queue • ignored comment'
+  }}
+
+# Developer-facing release queue: `/queue …` commands, queue:* labels, one sticky status comment
+# per PR, and a central "POC Release Queue" issue that also stores the queue state.
+# It orchestrates only: code validation stays in "POC - Build Release Candidate", which this
+# workflow dispatches (`/queue build`) and whose artifacts it reads when the run completes.
+# It never merges, pushes, creates branches, or runs PR code.
+on:
+  issue_comment:
+    types: [created]
+  workflow_run:
+    workflows: ['POC - Build Release Candidate']
+    types: [completed]
+  # Keeps the queue honest when a queued PR is closed, merged or gets new commits. No PR code is
+  # checked out. (Fork PRs get a read-only token here and are not supported in this POC.)
+  pull_request:
+    types: [closed, synchronize]
+    branches: [main]
+  # Fallback: re-process a finished candidate run by id if its workflow_run event was missed.
+  workflow_dispatch:
+    inputs:
+      result_run_id:
+        description: 'Candidate-builder run id to process'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  issues: write # queue issue, labels, comments
+  pull-requests: write # labels and sticky comments on PRs
+  actions: write # dispatch the candidate builder, read its runs and artifacts
+
+env:
+  QUEUE_IGNORED_ACTORS: github-actions[bot]
+
+jobs:
+  # Read-only, so it does not wait for (or displace) queued mutations.
+  status:
+    if: >-
+      github.event_name == 'issue_comment'
+      && startsWith(github.event.comment.body, '/queue status')
+      && github.event.comment.user.type != 'Bot'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: scripts/poc/queue
+          persist-credentials: false
+      - run: node scripts/poc/queue/main.mjs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+  manage:
+    if: >-
+      (github.event_name == 'issue_comment'
+        && startsWith(github.event.comment.body, '/queue')
+        && !startsWith(github.event.comment.body, '/queue status')
+        && github.event.comment.user.type != 'Bot')
+      || github.event_name == 'workflow_run'
+      || github.event_name == 'workflow_dispatch'
+      || (github.event_name == 'pull_request'
+        && contains(join(github.event.pull_request.labels.*.name, ' '), 'queue:'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # One queue mutation at a time; a running mutation is never cancelled.
+    # ponytail: GitHub keeps one pending run per group, so a 3rd command arriving while one runs
+    # and one waits replaces the waiting one (it shows as cancelled, with no reaction on the
+    # comment). Re-issue it; move state to an external store with locking if this matters.
+    concurrency:
+      group: poc-release-queue
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: scripts/poc/queue
+          persist-credentials: false
+
+      - name: Download candidate artifacts
+        if: github.event_name == 'workflow_run' || github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id || inputs.result_run_id }}
+        run: |
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/candidate-artifacts" \
+            || echo "No artifacts for run $RUN_ID; the result is derived from the run's steps."
+
+      - name: Update queue
+        run: node scripts/poc/queue/main.mjs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          QUEUE_ARTIFACTS_DIR: ${{ runner.temp }}/candidate-artifacts
