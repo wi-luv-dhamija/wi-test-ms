@@ -1,4 +1,5 @@
 import type { Task } from '../types/task';
+import { migrateTask } from './taskMigration';
 
 export const TASKS_STORAGE_KEY = 'flowboard.tasks';
 
@@ -8,7 +9,7 @@ export function loadTasks(): Task[] | null {
     const raw = localStorage.getItem(TASKS_STORAGE_KEY);
     if (raw === null) return null;
     const parsed: unknown = JSON.parse(raw);
-    return Array.isArray(parsed) ? (parsed as Task[]) : null;
+    return Array.isArray(parsed) ? parsed.map(migrateTask) : null;
   } catch {
     return null;
   }

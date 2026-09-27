@@ -25,7 +25,7 @@ describe('TaskService', () => {
       description: '',
       status: 'Pending',
       priority: 'Low',
-      assignee: 'Sam',
+      assignee: { id: 'user-sam', name: 'Sam' },
     });
     expect(TaskService.getAll()[0]).toEqual(task);
 
