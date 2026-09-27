@@ -1,4 +1,6 @@
 import { useState } from 'react';
+import { PriorityFilter } from '../components/PriorityFilter';
+import { filterByPriority, type PriorityFilterValue } from '../utils/priorityFilter';
 import { TaskCard } from '../components/TaskCard';
 import { TaskForm } from '../components/TaskForm';
 import { useTasks } from '../hooks/useTasks';
@@ -6,7 +8,9 @@ import type { Task } from '../types/task';
 import styles from './TasksPage.module.css';
 
 export function TasksPage() {
-  const { tasks, addTask, updateTask, changeStatus, deleteTask } = useTasks();
+  const { tasks: allTasks, addTask, updateTask, changeStatus, deleteTask } = useTasks();
+  const [priority, setPriority] = useState<PriorityFilterValue>('All');
+  const tasks = filterByPriority(allTasks, priority);
   const [isCreating, setIsCreating] = useState(false);
   const [editing, setEditing] = useState<Task | null>(null);
 
@@ -15,7 +19,7 @@ export function TasksPage() {
     setEditing(null);
   };
 
-  return (
+  const controls = (
     <>
       <div className="page-header">
         <h1>Tasks</h1>
@@ -25,6 +29,8 @@ export function TasksPage() {
           </button>
         )}
       </div>
+
+      <PriorityFilter value={priority} onChange={setPriority} />
 
       {isCreating && (
         <TaskForm
@@ -49,6 +55,21 @@ export function TasksPage() {
           onCancel={closeForm}
         />
       )}
+    </>
+  );
+
+  if (allTasks.length > 0 && tasks.length === 0) {
+    return (
+      <>
+        {controls}
+        <p className="muted">No tasks found for this priority.</p>
+      </>
+    );
+  }
+
+  return (
+    <>
+      {controls}
 
       {tasks.length === 0 ? (
         <p className="muted">No tasks yet. Add one to get started.</p>
