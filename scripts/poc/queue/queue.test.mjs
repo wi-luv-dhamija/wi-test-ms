@@ -1,9 +1,8 @@
 import {
-  activeEntries,
   addEntry,
   applyNewRevision,
   applyResult,
-  composition,
+  bumpRevision,
   emptyState,
   findEntry,
   moveEntry,
@@ -12,7 +11,9 @@ import {
   parseCommand,
   parseState,
   positionOf,
+  queueEntries,
   serializeState,
+  signature,
   transition,
 } from './queue.mjs';
 import { renderDashboard, renderPrComment } from './render.mjs';
@@ -30,7 +31,8 @@ const queueOf = (...numbers) => {
   for (const n of numbers) addEntry(state, pr(n), 'alice', 'QUEUED');
   return state;
 };
-const order = (state) => activeEntries(state).map((e) => e.number);
+const order = (state) => queueEntries(state).map((e) => e.number);
+const states = (state) => Object.fromEntries(state.entries.map((e) => [e.number, e.state]));
 
 describe('queue state persistence', () => {
   it('round-trips through the issue body, escaping text that could close the comment', () => {
@@ -39,6 +41,12 @@ describe('queue state persistence', () => {
     const body = `# dashboard\n${serializeState(state)}\n`;
     expect(body.split('-->').length).toBe(2); // only the real terminator
     expect(parseState(body)).toEqual(state);
+  });
+
+  it('fills fields added later when reading an older state', () => {
+    const { revision, ...old } = queueOf(1);
+    expect(revision).toBe(0);
+    expect(parseState(serializeState(old)).revision).toBe(0);
   });
 
   it('returns null when the body has no state block', () => {
@@ -56,11 +64,10 @@ describe('commands', () => {
 });
 
 describe('queue ordering', () => {
-  it('hold excludes a PR from the active queue; resume puts it at the end', () => {
+  it('hold removes a PR from the queue; resume puts it at the end', () => {
     const state = queueOf(1, 2, 5);
     transition(findEntry(state, 2), 'HELD');
     expect(order(state)).toEqual([1, 5]);
-    expect(composition(state).prs.map((e) => e.number)).toEqual([1, 5]);
     const e = findEntry(state, 2);
     transition(e, 'QUEUED');
     moveToEnd(state, e);
@@ -68,7 +75,7 @@ describe('queue ordering', () => {
     expect(positionOf(state, 2)).toBe(3);
   });
 
-  it('moves a PR to an active position, skipping held entries', () => {
+  it('moves a PR to a queue position, skipping entries outside the queue', () => {
     const state = queueOf(1, 2, 3, 5);
     transition(findEntry(state, 2), 'HELD');
     moveEntry(state, findEntry(state, 5), 1);
@@ -77,25 +84,61 @@ describe('queue ordering', () => {
     expect(order(state)).toEqual([1, 3, 5]);
   });
 
+  it('keeps an ejected PR in its slot so retry returns it to the same place', () => {
+    const state = queueOf(1, 2, 3);
+    transition(findEntry(state, 2), 'TEST_FAILED');
+    expect(order(state)).toEqual([1, 3]);
+    transition(findEntry(state, 2), 'QUEUED'); // /queue retry
+    expect(order(state)).toEqual([1, 2, 3]);
+  });
+
   it('numbers candidates deterministically', () => {
     const state = emptyState();
     expect([nextCandidateId(state), nextCandidateId(state)]).toEqual(['rc-001', 'rc-002']);
   });
+});
 
-  it('flags a new revision and requires revalidation of a validated PR', () => {
-    const state = queueOf(1);
-    const e = findEntry(state, 1);
+describe('revisions', () => {
+  it('changes the signature when the queued PRs or their SHAs change', () => {
+    const state = queueOf(1, 2);
+    const before = signature(state);
+    transition(findEntry(state, 2), 'HELD');
+    expect(signature(state)).not.toBe(before);
+    expect(signature(queueOf(1, 2))).toBe(before);
+  });
+
+  it('bumps the revision and sends validated PRs back to queued', () => {
+    const state = queueOf(1, 2);
+    transition(findEntry(state, 1), 'VALIDATED');
+    expect(bumpRevision(state)).toEqual([1]);
+    expect(state.revision).toBe(1);
+    expect(states(state)).toEqual({ 1: 'QUEUED', 2: 'QUEUED' });
+  });
+
+  it('pops a queued PR out of the queue on new commits', () => {
+    const state = queueOf(1, 2);
+    const e = findEntry(state, 2);
     transition(e, 'VALIDATED');
     expect(applyNewRevision(e, 'f'.repeat(40))).toBe(true);
-    expect(e.state).toBe('QUEUED');
-    expect(e.new_revision.to).toBe('f'.repeat(40));
+    expect(e.state).toBe('STALE_PR');
+    expect(e.new_revision).toMatchObject({ from: pr(2).head_sha, to: 'f'.repeat(40) });
+    expect(order(state)).toEqual([1]);
     expect(applyNewRevision(e, 'f'.repeat(40))).toBe(false);
+  });
+
+  it('only records the new SHA for a held PR', () => {
+    const state = queueOf(1);
+    const e = findEntry(state, 1);
+    transition(e, 'HELD');
+    applyNewRevision(e, 'e'.repeat(40));
+    expect(e.state).toBe('HELD');
+    expect(e.head_sha).toBe('e'.repeat(40));
   });
 });
 
 describe('candidate results', () => {
-  const building = (...numbers) => {
-    const state = queueOf(...numbers, 9);
+  const validating = (...numbers) => {
+    const state = queueOf(...numbers);
     for (const n of numbers) transition(findEntry(state, n), 'VALIDATING');
     state.current_candidate = {
       id: 'rc-001',
@@ -105,49 +148,62 @@ describe('candidate results', () => {
     };
     return state;
   };
-  const states = (state) => Object.fromEntries(state.entries.map((e) => [e.number, e.state]));
 
-  it('marks every PR validated on success', () => {
-    const state = building(1, 2, 5);
-    applyResult(state, { status: 'VALIDATED', candidate_sha: 'abc' });
-    expect(states(state)).toEqual({ 1: 'VALIDATED', 2: 'VALIDATED', 5: 'VALIDATED', 9: 'QUEUED' });
+  it('marks every PR validated on success, with nothing more to do', () => {
+    const state = validating(1, 2, 5);
+    expect(applyResult(state, { status: 'VALIDATED' }).revalidate).toBe(false);
+    expect(states(state)).toEqual({ 1: 'VALIDATED', 2: 'VALIDATED', 5: 'VALIDATED' });
   });
 
-  it('keeps the validated prefix, blocks the first failing addition and requeues the rest', () => {
-    const state = building(1, 2, 3, 5);
+  it('ejects the first failing PR and revalidates the PRs after it', () => {
+    const state = validating(1, 2, 3, 5);
     const detail = { type: 'TEST_FAILED', related_prs: [1, 3] };
-    applyResult(state, { status: 'TEST_FAILED', first_failing_pr: 3, passed_prs: [1, 2], detail });
+    const { revalidate } = applyResult(state, {
+      status: 'TEST_FAILED',
+      first_failing_pr: 3,
+      passed_prs: [1, 2],
+      detail,
+    });
     expect(states(state)).toEqual({
       1: 'VALIDATED',
       2: 'VALIDATED',
       3: 'TEST_FAILED',
       5: 'QUEUED',
-      9: 'QUEUED',
     });
-    expect(findEntry(state, 3).result_detail).toBe(detail);
-    expect(composition(state).blockers.map((e) => e.number)).toEqual([3]);
-    // Suggested next candidate without #3, never applied automatically.
-    expect(composition(state).prs.map((e) => e.number)).toEqual([1, 2, 5, 9]);
+    expect(revalidate).toBe(true);
+    expect(order(state)).toEqual([1, 2, 5]);
+    expect(findEntry(state, 3)).toMatchObject({
+      result_detail: detail,
+      failure: { candidate: 'rc-001', passed_prs: [1, 2], first_failing_pr: 3 },
+    });
+  });
+
+  it('does not rebuild when the failing PR was last (the prefix is already validated)', () => {
+    const state = validating(1, 2, 3);
+    const result = { status: 'MERGE_CONFLICT', first_failing_pr: 3, passed_prs: [1, 2] };
+    expect(applyResult(state, result).revalidate).toBe(false);
+    expect(order(state)).toEqual([1, 2]);
   });
 
   it('maps lint/build failures to BLOCKED', () => {
-    const state = building(1, 2);
+    const state = validating(1, 2);
     applyResult(state, { status: 'LINT_FAILED', first_failing_pr: 2, passed_prs: [1] });
     expect(findEntry(state, 2).state).toBe('BLOCKED');
   });
 
-  it('marks only the changed PR stale', () => {
-    const state = building(1, 2);
-    applyResult(state, { status: 'STALE_PR', stale_prs: { 2: 'e'.repeat(40) } });
-    expect(states(state)).toMatchObject({ 1: 'QUEUED', 2: 'STALE_PR' });
-    expect(findEntry(state, 2).new_revision).toMatchObject({
-      from: pr(2).head_sha,
-      to: 'e'.repeat(40),
+  it('pops the changed PR on STALE_PR and revalidates the rest', () => {
+    const state = validating(1, 2);
+    const { revalidate } = applyResult(state, {
+      status: 'STALE_PR',
+      stale_prs: { 2: 'e'.repeat(40) },
     });
+    expect(states(state)).toEqual({ 1: 'QUEUED', 2: 'STALE_PR' });
+    expect(findEntry(state, 2)).toMatchObject({ head_sha: 'e'.repeat(40) });
+    expect(revalidate).toBe(true);
   });
 
   it('does not re-add a PR held or removed while the candidate ran', () => {
-    const state = building(1, 2);
+    const state = validating(1, 2);
     transition(findEntry(state, 2), 'REMOVED');
     applyResult(state, { status: 'VALIDATED' });
     expect(states(state)).toMatchObject({ 1: 'VALIDATED', 2: 'REMOVED' });
@@ -156,10 +212,9 @@ describe('candidate results', () => {
 });
 
 describe('rendering', () => {
-  it('shows blockers and the suggested candidate on the dashboard', () => {
+  it('lists ejected PRs with their diagnosis and re-entry commands', () => {
     const state = queueOf(1, 2, 3, 5);
-    const e = findEntry(state, 3);
-    transition(e, 'TEST_FAILED', {
+    transition(findEntry(state, 3), 'TEST_FAILED', {
       result_detail: {
         type: 'TEST_FAILED',
         related_prs: [1, 3],
@@ -167,9 +222,9 @@ describe('rendering', () => {
       },
     });
     const md = renderDashboard(state);
-    expect(md).toContain('## Current blocker');
+    expect(md).toContain('## Ejected — needs action');
     expect(md).toContain('#1 ↔ #3');
-    expect(md).toContain('Suggested next candidate if #3 is held: **#1,#2,#5**');
+    expect(md).not.toContain('/queue build');
     expect(parseState(md)).toEqual(state);
   });
 

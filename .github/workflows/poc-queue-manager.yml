@@ -1,7 +1,8 @@
 name: POC - Queue Manager
 run-name: >-
   ${{
-    github.event_name == 'workflow_dispatch' && format('Queue • RESULT • {0}', inputs.result_run_id || 'current candidate')
+    github.event_name == 'workflow_dispatch' && format('Queue • VALIDATE • {0}', inputs.reason || 'manual')
+    || github.event_name == 'push' && format('Queue • MAIN UPDATED • @{0}', github.event.pusher.name)
     || github.event_name == 'pull_request' && format('Queue • PR {0} • #{1}', github.event.action, github.event.pull_request.number)
     || startsWith(github.event.comment.body, '/queue') && format('Queue • {0} • #{1} • @{2}',
       startsWith(github.event.comment.body, '/queue add') && 'ADD'
@@ -11,7 +12,7 @@ run-name: >-
       || startsWith(github.event.comment.body, '/queue retry') && 'RETRY'
       || startsWith(github.event.comment.body, '/queue status') && 'STATUS'
       || startsWith(github.event.comment.body, '/queue move') && 'MOVE'
-      || startsWith(github.event.comment.body, '/queue build') && 'BUILD'
+      || startsWith(github.event.comment.body, '/queue revalidate') && 'REVALIDATE'
       || startsWith(github.event.comment.body, '/queue freeze') && 'FREEZE'
       || startsWith(github.event.comment.body, '/queue unfreeze') && 'UNFREEZE'
       || 'COMMAND',
@@ -19,30 +20,38 @@ run-name: >-
     || 'Queue • ignored comment'
   }}
 
-# Developer-facing release queue: `/queue …` commands, queue:* labels, one sticky status comment
-# per PR, and a central "POC Release Queue" issue that also stores the queue state.
-# It orchestrates only: code validation stays in "POC - Build Release Candidate", which this
-# workflow dispatches (`/queue build`) and whose artifacts it reads when the run completes.
-# It never merges, pushes, creates branches, or runs PR code.
+# Developer-facing release queue that validates itself: `/queue …` commands, queue:* labels, one
+# sticky status comment per PR, and a central "POC Release Queue" issue that stores the state.
+# Every change to the queued PRs (add/remove/hold/resume/retry/move, new commits, closed PRs) or
+# to main requests a new candidate; the newest queue revision always wins.
 #
-# Build flow, all in the run of the `/queue build` comment:
-#   manage (dispatch, holds the queue lock briefly) → await-candidate (waits, no lock)
-#   → record-result (applies the result, holds the lock briefly)
-# A workflow_run trigger can't be used: runs dispatched with GITHUB_TOKEN don't emit it.
+#   comment / PR event / push to main ──► manage (updates the queue, dispatches a validate run)
+#   validate run: settle (debounce) ─► start (cancel outdated candidate, dispatch builder)
+#                 ─► await (wait for the builder, no lock) ─► record (apply the result)
+#
+# Code validation stays in "POC - Build Release Candidate". This workflow never merges, pushes,
+# creates branches, or runs PR code. (A workflow_run trigger can't be used: runs dispatched with
+# GITHUB_TOKEN don't emit it, so the validate run waits for its own candidate instead.)
 on:
   issue_comment:
     types: [created]
-  # Keeps the queue honest when a queued PR is closed, merged or gets new commits. No PR code is
-  # checked out. (Fork PRs get a read-only token here and are not supported in this POC.)
+  # A queued PR that gets new commits pops out of the queue; a closed/merged PR leaves it.
+  # No PR code is checked out. (Fork PRs get a read-only token and are not supported.)
   pull_request:
     types: [closed, synchronize]
     branches: [main]
-  # Fallback: record a candidate result by hand (e.g. if a build's run was cancelled while
-  # waiting). Leave the input empty to use the queue's current validating candidate.
+  push:
+    branches: [main]
+  # Dispatched by this workflow after every queue change. Run it by hand (inputs empty) to
+  # revalidate the current queue, e.g. after a flaky failure or if a run was cancelled.
   workflow_dispatch:
     inputs:
-      result_run_id:
-        description: 'Optional: candidate-builder run id or URL. Empty = current candidate.'
+      revision:
+        description: 'Queue revision to validate (set by the queue; leave empty for a manual run)'
+        required: false
+        type: string
+      reason:
+        description: 'Why validation was requested (shown in the run name)'
         required: false
         type: string
 
@@ -50,10 +59,11 @@ permissions:
   contents: read
   issues: write # queue issue, labels, comments
   pull-requests: write # labels and sticky comments on PRs
-  actions: write # dispatch the candidate builder, read its runs and artifacts
+  actions: write # dispatch/cancel candidate builds and validate runs, read their artifacts
 
 env:
   QUEUE_IGNORED_ACTORS: github-actions[bot]
+  QUEUE_DEBOUNCE_SECONDS: 30
 
 jobs:
   # Read-only, so it does not wait for (or displace) queued mutations.
@@ -80,16 +90,15 @@ jobs:
         && startsWith(github.event.comment.body, '/queue')
         && !startsWith(github.event.comment.body, '/queue status')
         && github.event.comment.user.type != 'Bot')
+      || github.event_name == 'push'
       || (github.event_name == 'pull_request'
         && contains(join(github.event.pull_request.labels.*.name, ' '), 'queue:'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    outputs:
-      candidate_id: ${{ steps.update.outputs.candidate_id }}
     # One queue mutation at a time; a running mutation is never cancelled.
-    # ponytail: GitHub keeps one pending run per group, so a 3rd command arriving while one runs
-    # and one waits replaces the waiting one (it shows as cancelled, with no reaction on the
-    # comment). Re-issue it; move state to an external store with locking if this matters.
+    # ponytail: GitHub keeps one pending job per group, so a 3rd job arriving while one runs and
+    # one waits replaces the waiting one (shown as cancelled). Queue changes self-heal because the
+    # next change revalidates; re-issue a lost command. Use an external lock if this matters.
     concurrency:
       group: poc-release-queue
       cancel-in-progress: false
@@ -99,19 +108,49 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           sparse-checkout: scripts/poc/queue
           persist-credentials: false
-
       - name: Update queue
-        id: update
         run: node scripts/poc/queue/main.mjs
         env:
           GITHUB_TOKEN: ${{ github.token }}
 
-  # After `/queue build` (or a manual run): wait for the candidate run without holding the lock.
-  await-candidate:
-    needs: manage
-    if: >-
-      !cancelled()
-      && (needs.manage.outputs.candidate_id != '' || github.event_name == 'workflow_dispatch')
+  # ---- Validate run (workflow_dispatch) ----
+  # Debounce: let a burst of queue changes settle so only the newest revision is built.
+  settle:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Wait for further queue changes
+        if: inputs.revision != ''
+        run: sleep "$QUEUE_DEBOUNCE_SECONDS"
+
+  start:
+    needs: settle
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      candidate_id: ${{ steps.start.outputs.candidate_id }}
+    concurrency:
+      group: poc-release-queue
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: scripts/poc/queue
+          persist-credentials: false
+      - name: Start candidate for the newest queue revision
+        id: start
+        run: node scripts/poc/queue/main.mjs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          QUEUE_MODE: start
+          REVISION: ${{ inputs.revision }}
+          REASON: ${{ inputs.reason }}
+
+  await:
+    needs: start
+    if: needs.start.outputs.candidate_id != ''
     runs-on: ubuntu-latest
     timeout-minutes: 55
     outputs:
@@ -122,18 +161,17 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           sparse-checkout: scripts/poc/queue
           persist-credentials: false
-      - name: Wait for candidate run
+      - name: Wait for the candidate build
         id: wait
         run: node scripts/poc/queue/main.mjs
         env:
           GITHUB_TOKEN: ${{ github.token }}
           QUEUE_MODE: await
-          CANDIDATE_ID: ${{ needs.manage.outputs.candidate_id }}
-          RUN_INPUT: ${{ inputs.result_run_id }}
+          CANDIDATE_ID: ${{ needs.start.outputs.candidate_id }}
 
-  record-result:
-    needs: await-candidate
-    if: ${{ !cancelled() && needs.await-candidate.outputs.run_id != '' }}
+  record:
+    needs: await
+    if: needs.await.outputs.run_id != ''
     runs-on: ubuntu-latest
     timeout-minutes: 10
     concurrency:
@@ -148,14 +186,14 @@ jobs:
       - name: Download candidate artifacts
         env:
           GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ needs.await-candidate.outputs.run_id }}
+          RUN_ID: ${{ needs.await.outputs.run_id }}
         run: |
           gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/candidate-artifacts" \
             || echo "No artifacts for run $RUN_ID; the result is derived from the run's steps."
-      - name: Record candidate result
+      - name: Record the candidate result
         run: node scripts/poc/queue/main.mjs
         env:
           GITHUB_TOKEN: ${{ github.token }}
           QUEUE_MODE: record
-          RESULT_RUN_ID: ${{ needs.await-candidate.outputs.run_id }}
+          RESULT_RUN_ID: ${{ needs.await.outputs.run_id }}
           QUEUE_ARTIFACTS_DIR: ${{ runner.temp }}/candidate-artifacts

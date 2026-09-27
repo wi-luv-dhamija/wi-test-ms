@@ -80,28 +80,31 @@ diagnosis artifact.
 ### Release queue manager
 
 `.github/workflows/poc-queue-manager.yml` (**POC - Queue Manager**) is a developer-facing queue
-on top of the candidate builder. It only orchestrates and reports: it never merges, pushes,
-creates branches or changes code.
+on top of the candidate builder that **validates itself**. It never merges, pushes, creates
+branches or changes code.
 
 - **Commands:** comment on a PR with `/queue add`, `remove`, `hold`, `resume`, `retry` or
-  `status`. On the **POC Release Queue** issue, comment `/queue status`, `build [rc-id]`,
-  `freeze`, `unfreeze` or `move #PR POS`. The PR commands also work there as `/queue hold #PR`.
-  Changing the queue needs write access; anyone can use `status`.
-- **Visibility:** each PR gets one `queue:*` state label and one status comment that is updated
-  in place. The issue shows the active queue (position, author, head SHA, state), the current
-  candidate, blockers with their diagnosis, held PRs, and what `/queue build` would include.
-- **State:** stored as JSON inside the issue description, so don't edit that by hand. Commands
-  that change the queue run one at a time.
-- **Build and results:** `/queue build` marks the active PRs `VALIDATING` and dispatches the
-  candidate builder with `prs` in queue order. When that run finishes, its artifacts (manifest
-  or diagnosis) update the labels, comments and dashboard. The first failing addition becomes
-  `TEST_FAILED`, `MERGE_CONFLICT` or `BLOCKED`, the passing PRs before it become `VALIDATED`,
-  and the queue suggests a next candidate but never drops a PR on its own.
-- **Build flow:** the run started by the `/queue build` comment waits for the candidate build
-  and then records its result, because builds started by the built-in token don't trigger other
-  workflows. If a result is ever missing, run **POC - Queue Manager** by hand with the input
-  left empty: it finds the current candidate's run and records it.
-- **Workflow file on `main`:** comment commands only use the version on `main`.
+  `status`. On the **POC Release Queue** issue, comment `/queue status`, `revalidate`, `freeze`,
+  `unfreeze` or `move #PR POS`. The PR commands also work there as `/queue hold #PR`. Changing
+  the queue needs write access; anyone can use `status`.
+- **Continuous validation:** any change to the queued PRs (add, remove, hold, resume, retry,
+  move, a PR closed or merged) or a push to `main` starts a new candidate of the whole queue,
+  after a 30-second debounce. The newest queue revision wins: an outdated candidate build is
+  cancelled. There is no build command.
+- **Failures eject:** the first failing PR of a candidate leaves the queue (`queue:test-failed`,
+  `queue:merge-conflict` or `queue:blocked`, with its diagnosis). The PRs before it stay
+  validated, and the rest of the queue is revalidated without it.
+- **New commits pop a PR out** (`queue:stale`), because its validation no longer matches the
+  code. `/queue retry` returns an ejected PR to its previous place; `/queue add` puts it at the
+  end.
+- **Visibility:** each PR has one `queue:*` label (`queued` → `validating` → `validated`) and
+  one status comment updated in place. The issue shows the queue, the current candidate, ejected
+  PRs with their diagnosis, and held PRs.
+- **State:** stored as JSON inside the issue description, so don't edit that by hand. Changes to
+  the queue run one at a time.
+- **Manual revalidation:** comment `/queue revalidate`, or run **POC - Queue Manager** by hand
+  with empty inputs (e.g. after a flaky failure). Comment commands use the workflow file on
+  `main`.
 
 ### Triggering it
 

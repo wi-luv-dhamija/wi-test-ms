@@ -1,13 +1,17 @@
 #!/usr/bin/env node
-// POC release queue manager. Handles one GitHub event per run:
-//   issue_comment    `/queue …` commands on PRs or on the queue issue
-//   pull_request     a queued PR was closed/merged or got new commits
-// and two helper modes used by later jobs of the same workflow run:
-//   QUEUE_MODE=await   wait for a candidate-builder run to finish (after /queue build, or on a
-//                      manual run for the current candidate) and output its run id
-//   QUEUE_MODE=record  apply that finished run's result (from its artifacts) to the queue
-// It only changes queue metadata (issue body, labels, comments) and dispatches the existing
-// candidate builder. It never merges, pushes, or changes code.
+// POC release queue manager. The queue validates itself: every change to the queued PRs (or a
+// push to main) bumps the queue revision and requests a new candidate.
+//
+// Event handlers (one per run):
+//   issue_comment  `/queue …` commands on PRs or on the queue issue
+//   pull_request   a queued PR was closed/merged or got new commits (new commits pop it out)
+//   push           main changed: revalidate the queue on the new base
+// Validation pipeline (a separate "validate" run of this workflow, one job per mode):
+//   QUEUE_MODE=start   after a short debounce: skip if a newer revision exists, cancel the
+//                      outdated candidate run, dispatch the candidate builder
+//   QUEUE_MODE=await   wait for that candidate run (no queue lock held)
+//   QUEUE_MODE=record  apply its result; an ejection requests the next revalidation
+// It never merges, pushes, or changes code.
 import { createHash } from 'node:crypto';
 import { appendFileSync, existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
@@ -24,17 +28,15 @@ import {
   upsertSticky,
 } from './github.mjs';
 import {
-  ACTIVE,
-  activeEntries,
   addEntry,
   applyNewRevision,
   applyResult,
-  BLOCKING,
-  CANDIDATE_ID,
+  bumpRevision,
   COMMANDS,
-  composition,
+  EJECTED,
   emptyState,
   findEntry,
+  IN_QUEUE,
   INACTIVE,
   LABEL_COLORS,
   moveEntry,
@@ -46,8 +48,10 @@ import {
   parseState,
   pruneInactive,
   QUEUE_ISSUE_ONLY,
+  queueEntries,
   queueLine,
   recordHistory,
+  signature,
   STATE_LABELS,
   transition,
 } from './queue.mjs';
@@ -65,14 +69,19 @@ const EVENT = process.env.GITHUB_EVENT_NAME;
 const ev = JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8'));
 const BASE = process.env.QUEUE_BASE_BRANCH ?? 'main';
 const CANDIDATE_WORKFLOW = process.env.CANDIDATE_WORKFLOW ?? 'poc-candidate-builder.yml';
+const QUEUE_WORKFLOW = process.env.QUEUE_WORKFLOW ?? 'poc-queue-manager.yml';
+const BUILDER_NAME = 'POC - Build Release Candidate';
 const IGNORED_ACTORS = new Set((process.env.QUEUE_IGNORED_ACTORS ?? '').split(',').filter(Boolean));
-const VALIDATING_TIMEOUT_MS = 60 * 60 * 1000; // candidate builder times out at 45 minutes
-const SERVER = process.env.GITHUB_SERVER_URL ?? 'https://github.com';
+const REF = ev.repository?.default_branch ?? BASE;
+const ACTOR = process.env.GITHUB_ACTOR ?? 'unknown';
 
 const summary = (md) =>
   process.env.GITHUB_STEP_SUMMARY && appendFileSync(process.env.GITHUB_STEP_SUMMARY, md + '\n');
+const output = (key, value) =>
+  process.env.GITHUB_OUTPUT && appendFileSync(process.env.GITHUB_OUTPUT, `${key}=${value}\n`);
 const refs = (numbers) => numbers.map((n) => `#${n}`).join(',');
 const short = (sha) => sha?.slice(0, 12);
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // ---- Queue issue (the durable state) ----
 async function loadQueue({ create }) {
@@ -107,7 +116,10 @@ async function loadQueue({ create }) {
 
 const hash = (text) => createHash('sha1').update(text).digest('hex');
 
-/** Persists state + dashboard, then brings labels and sticky comments in line with it. */
+/**
+ * Persists state + dashboard, brings labels and sticky comments in line with it, and then
+ * dispatches the validation run if this change requested one.
+ */
 async function save(ctx, touched = new Set()) {
   pruneInactive(ctx.state);
   await api('PATCH', `${REPO}/issues/${ctx.issue.number}`, { body: renderDashboard(ctx.state) });
@@ -134,8 +146,42 @@ async function save(ctx, touched = new Set()) {
     }
   }
   // Store the sticky comment ids/hashes so later runs update instead of searching.
-  if (refreshed)
+  if (refreshed) {
     await api('PATCH', `${REPO}/issues/${ctx.issue.number}`, { body: renderDashboard(ctx.state) });
+  }
+  if (ctx.validation) {
+    const { revision, reason } = ctx.validation;
+    ctx.validation = null;
+    try {
+      await api('POST', `${REPO}/actions/workflows/${QUEUE_WORKFLOW}/dispatches`, {
+        ref: REF,
+        inputs: { revision: String(revision), reason },
+      });
+      console.log(`Requested validation of queue revision ${revision} (${reason}).`);
+    } catch (err) {
+      console.log(
+        `::error::Could not start validation: ${err.message}. Run "POC - Queue Manager" manually to revalidate.`,
+      );
+    }
+  }
+}
+
+/** Marks the queue as changed: everything queued must be validated again. */
+function requestValidation(ctx, reason, touched) {
+  for (const n of bumpRevision(ctx.state)) touched.add(n);
+  ctx.validation = { revision: ctx.state.revision, reason };
+  recordHistory(ctx.state, {
+    op: 'REVALIDATE',
+    by: 'queue',
+    detail: `revision ${ctx.state.revision}: ${reason}`,
+  });
+}
+
+/** Requests validation if the queued PRs (or their SHAs) changed since `before`. */
+function revalidateIfChanged(ctx, before, reason, touched) {
+  if (signature(ctx.state) === before) return false;
+  requestValidation(ctx, reason, touched);
+  return true;
 }
 
 const prInfo = (pr) => ({
@@ -146,7 +192,10 @@ const prInfo = (pr) => ({
   head_sha: pr.head.sha,
 });
 
-/** Re-reads a PR; closed/merged PRs leave the queue. Returns the PR, or null if it is gone. */
+/**
+ * Re-reads a PR. Closed/merged PRs leave the queue; a new head SHA pops a queued PR out.
+ * Returns the PR, or null if it is gone.
+ */
 async function refreshEntry(entry, notes) {
   const pr = await getPr(entry.number);
   if (!pr || pr.state !== 'open') {
@@ -160,18 +209,38 @@ async function refreshEntry(entry, notes) {
   const before = entry.head_sha;
   if (applyNewRevision(entry, pr.head.sha)) {
     notes.push(
-      `PR #${entry.number} changed while queued. Queued SHA: \`${short(before)}\`, current SHA: \`${short(pr.head.sha)}\` (NEW_REVISION).`,
+      `PR #${entry.number} has new commits (\`${short(before)}\` → \`${short(pr.head.sha)}\`)${entry.state === 'STALE_PR' ? ' and left the queue' : ''}.`,
     );
   }
   return pr;
+}
+
+/** Puts an ejected PR back into the queue, either at its old place or at the end. */
+async function reenter(ctx, entry, { toEnd }, notes) {
+  const failedSha = entry.result_sha ?? entry.head_sha;
+  const pr = await refreshEntry(entry, notes);
+  if (!pr) return false;
+  if (entry.head_sha !== failedSha) {
+    notes.push(
+      `New PR head detected.\n\nPrevious: \`${short(failedSha)}\`\n\nCurrent: \`${short(entry.head_sha)}\``,
+    );
+  } else if (entry.state !== 'STALE_PR') {
+    notes.push(
+      `No new commits since the failure (\`${short(failedSha)}\`); it will likely fail the same way unless another PR changed.`,
+    );
+  }
+  transition(entry, 'QUEUED', { state_reason: null, result_detail: null, failure: null });
+  if (toEnd) moveToEnd(ctx.state, entry);
+  return true;
 }
 
 // ---- Commands ----
 async function handleComment() {
   const { comment: c, issue } = ev;
   const user = c.user.login;
-  if (c.user.type === 'Bot' || user.endsWith('[bot]') || IGNORED_ACTORS.has(user))
+  if (c.user.type === 'Bot' || user.endsWith('[bot]') || IGNORED_ACTORS.has(user)) {
     return console.log(`Ignoring comment by ${user}.`);
+  }
   const cmd = parseCommand(c.body);
   if (!cmd) return console.log('Not a /queue command.');
 
@@ -230,30 +299,45 @@ async function handleComment() {
   const entry = target ? findEntry(state, target) : null;
   const touched = new Set();
   const notes = [];
+  const before = signature(state);
+  const frozenMessage =
+    'Queue is currently frozen.\n\nThis PR will not be added to the active candidate.';
 
   switch (cmd.name) {
     case 'status': {
-      if (onPr && !entry)
+      op.outcome = 'READ-ONLY';
+      if (onPr && !entry) {
         return finish(
           `PR #${target} is not in the release queue. Use \`/queue add\` to join.\n\n${renderStatus(state, null)}`,
         );
-      op.outcome = 'READ-ONLY';
+      }
       return finish(renderStatus(state, entry));
     }
 
     case 'add': {
       if (!target)
         return reject('Use `/queue add` on a PR, or `/queue add #PR` on the queue issue.');
+      if (entry && IN_QUEUE.has(entry.state)) {
+        return reject(`PR #${target} is already in the queue (${entry.state}).`);
+      }
+      if (entry?.state === 'HELD') return reject(`PR #${target} is held. Use \`/queue resume\`.`);
+      if (entry?.state === 'READY') {
+        return reject(`PR #${target} is already waiting for the queue to unfreeze.`);
+      }
       const pr = await getPr(target);
       if (!pr) return reject(`PR #${target} does not exist.`);
       if (pr.state !== 'open') return reject(`PR #${target} is not open.`);
       if (pr.draft) return reject(`PR #${target} is a draft. Mark it ready for review first.`);
-      if (pr.base.ref !== BASE)
+      if (pr.base.ref !== BASE) {
         return reject(`PR #${target} targets \`${pr.base.ref}\` instead of \`${BASE}\`.`);
-      if (entry && !INACTIVE.has(entry.state))
-        return reject(`PR #${target} is already in the queue (${entry.state}).`);
+      }
       op.prev = entry?.state ?? 'NOT_QUEUED';
       if (state.frozen) {
+        if (entry && EJECTED.has(entry.state)) {
+          return reject(
+            `${frozenMessage} It stays ${entry.state}; re-add it after \`/queue unfreeze\`.`,
+          );
+        }
         addEntry(state, prInfo(pr), user, 'READY');
         op.next = 'READY';
         op.outcome = 'DEFERRED';
@@ -261,12 +345,20 @@ async function handleComment() {
         touched.add(target);
         await save(ctx, touched);
         return finish(
-          `Queue is currently frozen.\n\nThis PR will not be added to the active candidate. It is marked \`queue:ready\` and will be queued when the queue is unfrozen.`,
+          `${frozenMessage} It is marked \`queue:ready\` and will be queued when the queue is unfrozen.`,
           'eyes',
         );
       }
-      addEntry(state, prInfo(pr), user, 'QUEUED');
-      op.next = 'QUEUED';
+      if (entry && EJECTED.has(entry.state)) {
+        if (!(await reenter(ctx, entry, { toEnd: true }, notes))) {
+          op.outcome = 'REJECTED';
+        } else {
+          notes.unshift(`#${target} rejoined the queue at the end.`);
+        }
+      } else {
+        addEntry(state, prInfo(pr), user, 'QUEUED');
+      }
+      op.next = findEntry(state, target).state;
       recordHistory(state, { op: 'ADD', pr: target, by: user });
       touched.add(target);
       break;
@@ -276,20 +368,14 @@ async function handleComment() {
       if (!entry || INACTIVE.has(entry.state)) return reject(`PR #${target} is not in the queue.`);
       op.prev = transition(entry, 'REMOVED', { state_reason: `removed by @${user}` });
       op.next = 'REMOVED';
-      if (op.prev === 'VALIDATING')
-        notes.push(
-          `#${target} was in the validating candidate; its result will be recorded but it stays removed.`,
-        );
       recordHistory(state, { op: 'REMOVE', pr: target, by: user });
       touched.add(target);
       break;
     }
 
     case 'hold': {
-      if (!entry || !(ACTIVE.has(entry.state) || entry.state === 'READY')) {
-        return reject(
-          `PR #${target} is not in the active queue${entry ? ` (${entry.state})` : ''}.`,
-        );
+      if (!entry || INACTIVE.has(entry.state) || entry.state === 'HELD') {
+        return reject(`PR #${target} is not in the queue${entry ? ` (${entry.state})` : ''}.`);
       }
       op.prev = transition(entry, 'HELD', { state_reason: `held by @${user}` });
       op.next = 'HELD';
@@ -299,14 +385,16 @@ async function handleComment() {
     }
 
     case 'resume': {
-      if (entry?.state !== 'HELD')
+      if (entry?.state !== 'HELD') {
         return reject(`PR #${target} is not held${entry ? ` (${entry.state})` : ''}.`);
-      if (state.frozen)
+      }
+      if (state.frozen) {
         return reject(
-          'Queue is currently frozen.\n\nThis PR will not be added to the active candidate. It stays held; `/queue resume` again after `/queue unfreeze`.',
+          `${frozenMessage} It stays held; \`/queue resume\` again after \`/queue unfreeze\`.`,
         );
+      }
+      touched.add(target);
       if (!(await refreshEntry(entry, notes))) {
-        touched.add(target);
         op.outcome = 'REJECTED';
         break;
       }
@@ -314,55 +402,48 @@ async function handleComment() {
       op.next = 'QUEUED';
       moveToEnd(state, entry);
       recordHistory(state, { op: 'RESUME', pr: target, by: user });
-      touched.add(target);
       break;
     }
 
     case 'retry': {
-      if (!entry || !BLOCKING.has(entry.state)) {
+      if (!entry || !EJECTED.has(entry.state)) {
         return reject(
-          `\`/queue retry\` applies to PRs in TEST_FAILED, MERGE_CONFLICT, STALE_PR or BLOCKED; PR #${target} is ${entry?.state ?? 'not queued'}.`,
+          `\`/queue retry\` applies to ejected PRs (TEST_FAILED, MERGE_CONFLICT, STALE_PR, BLOCKED); PR #${target} is ${entry?.state ?? 'not queued'}.`,
         );
       }
-      const failedSha = entry.result_sha ?? entry.head_sha;
-      const pr = await getPr(target);
-      if (!pr || pr.state !== 'open') {
-        await refreshEntry(entry, notes);
-        touched.add(target);
+      if (state.frozen) return reject(`${frozenMessage} Retry it after \`/queue unfreeze\`.`);
+      op.prev = entry.state;
+      touched.add(target);
+      if (!(await reenter(ctx, entry, { toEnd: false }, notes))) {
         op.outcome = 'REJECTED';
         break;
       }
-      if (pr.head.sha !== failedSha) {
-        notes.push(
-          `New PR head detected.\n\nPrevious: \`${short(failedSha)}\`\n\nCurrent: \`${short(pr.head.sha)}\``,
-        );
-        entry.new_revision = { from: failedSha, to: pr.head.sha, at: new Date().toISOString() };
-      } else {
-        notes.push(
-          `No new commits since the failure (\`${short(failedSha)}\`). The same combination will likely fail again unless another PR changed.`,
-        );
-      }
-      entry.head_sha = pr.head.sha;
-      entry.title = pr.title;
-      op.prev = transition(entry, 'QUEUED', { state_reason: null, result_detail: null });
       op.next = 'QUEUED';
+      notes.unshift(
+        `#${target} is back at queue position ${queueEntries(state).indexOf(entry) + 1}.`,
+      );
       recordHistory(state, { op: 'RETRY', pr: target, by: user, detail: `was ${op.prev}` });
-      touched.add(target);
       break;
     }
 
     case 'move': {
       const pos = Number(cmd.args.find((a) => /^\d+$/.test(a)));
-      if (!target || !pos)
+      if (!target || !pos) {
         return reject('Usage: `/queue move #PR POSITION` (for example `/queue move #5 2`).');
-      if (state.frozen)
-        return reject('Queue is currently frozen. The active candidate order cannot change.');
-      if (!entry || !ACTIVE.has(entry.state))
-        return reject(`PR #${target} is not in the active queue.`);
-      const before = activeEntries(state).indexOf(entry) + 1;
+      }
+      if (state.frozen) return reject('Queue is currently frozen. The queue order cannot change.');
+      if (!entry || !IN_QUEUE.has(entry.state)) return reject(`PR #${target} is not in the queue.`);
+      const from = queueEntries(state).indexOf(entry) + 1;
       moveEntry(state, entry, pos);
-      op.message = `Moved #${target} from position ${before} to ${activeEntries(state).indexOf(entry) + 1}.`;
+      op.message = `Moved #${target} from position ${from} to ${queueEntries(state).indexOf(entry) + 1}.`;
       recordHistory(state, { op: 'MOVE', pr: target, by: user, detail: op.message });
+      break;
+    }
+
+    case 'revalidate': {
+      if (!queueEntries(state).length) return reject('The queue is empty; nothing to validate.');
+      requestValidation(ctx, `requested by @${user}`, touched);
+      op.message = `Revalidating queue revision ${state.revision}: ${queueLine(queueEntries(state))}.`;
       break;
     }
 
@@ -379,131 +460,201 @@ async function handleComment() {
       if (!freezing) {
         const ready = state.entries.filter((e) => e.state === 'READY');
         for (const e of ready) {
+          await refreshEntry(e, notes);
+          if (e.state !== 'READY') continue;
           transition(e, 'QUEUED', { state_reason: null });
           moveToEnd(state, e);
           touched.add(e.number);
         }
-        if (ready.length)
-          notes.push(`Queued PRs that were waiting: ${refs(ready.map((e) => e.number))}.`);
+        if (touched.size) notes.push(`Queued PRs that were waiting: ${refs([...touched])}.`);
       }
       recordHistory(state, { op: cmd.name.toUpperCase(), by: user });
       op.message = freezing
-        ? 'Queue is now FROZEN: `/queue add`, `/queue resume` and `/queue move` will not change the active candidate.'
+        ? 'Queue is now FROZEN: `/queue add`, `/queue resume`, `/queue retry` and `/queue move` are paused. Removing or holding PRs still works and revalidates the queue.'
         : 'Queue is now OPEN.';
       break;
     }
-
-    case 'build':
-      return build(ctx, cmd, op, finish, reject);
   }
 
+  if (cmd.name !== 'revalidate') {
+    const why = `${cmd.name.toUpperCase()}${target ? ` #${target}` : ''} by @${user}`;
+    revalidateIfChanged(ctx, before, why, touched);
+  }
   await save(ctx, touched);
+  // Plain successes are acknowledged with a reaction; anything with extra information gets a
+  // reply. The revalidation itself shows on the dashboard, PR comments and the job summary.
   const message = [op.message, ...notes].filter(Boolean).join('\n\n');
-  if (message) op.message = message;
-  // Plain successes are acknowledged with a reaction; anything with extra information gets a reply.
+  op.message = [message, `Queue revision ${state.revision}: ${queueLine(queueEntries(state))}.`]
+    .filter(Boolean)
+    .join('\n\n');
   return finish(message || null);
 }
 
-async function build(ctx, cmd, op, finish, reject) {
+// ---- Validation pipeline ----
+/** Latest candidate-builder run for a candidate id created at/after `notBefore`, or null. */
+async function findCandidateRun(candidateId, notBefore) {
+  const earliest = notBefore ? Date.parse(notBefore) - 60_000 : 0; // allow for clock skew
+  const { workflow_runs: runs } = await api(
+    'GET',
+    `${REPO}/actions/workflows/${CANDIDATE_WORKFLOW}/runs?event=workflow_dispatch&per_page=30`,
+  );
+  return (
+    runs
+      .filter((r) => r.display_title?.startsWith(`Candidate ${candidateId} (`))
+      .filter((r) => Date.parse(r.created_at) >= earliest)
+      .sort((a, b) => b.created_at.localeCompare(a.created_at))[0] ?? null
+  );
+}
+
+/** QUEUE_MODE=start: validate the newest queue revision (REVISION empty = manual run). */
+async function startCandidate() {
+  const ctx = await loadQueue({ create: false });
+  if (!ctx) return summary('# Queue Validation\n\nNo queue exists yet.');
   const { state } = ctx;
-  const explicitId = cmd.args[0];
-  if (explicitId && !CANDIDATE_ID.test(explicitId))
-    return reject(`Invalid candidate id \`${explicitId}\` (letters, digits, \`.\`, \`_\`, \`-\`).`);
   const touched = new Set();
   const notes = [];
-  const cc = state.current_candidate;
-  if (cc?.status === 'VALIDATING') {
-    if (Date.now() - Date.parse(cc.started_at) < VALIDATING_TIMEOUT_MS) {
-      return reject(
-        `Candidate **${cc.id}** is still validating (started ${cc.started_at}). Wait for its result before building again.`,
-      );
-    }
-    cc.status = 'ABANDONED';
-    cc.note = 'No result arrived within 60 minutes.';
-    for (const e of state.entries.filter((x) => x.state === 'VALIDATING')) {
-      transition(e, 'QUEUED');
-      touched.add(e.number);
-    }
-    notes.push(`Candidate ${cc.id} produced no result within 60 minutes and was marked ABANDONED.`);
+  let reason = process.env.REASON || `manual run by @${ACTOR}`;
+  const wanted = process.env.REVISION ? Number(process.env.REVISION) : null;
+  if (wanted === null) {
+    if (!queueEntries(state).length) return summary('# Queue Validation\n\nThe queue is empty.');
+    requestValidation(ctx, reason, touched);
+    ctx.validation = null; // this run validates it
+  } else if (wanted !== state.revision) {
+    const msg = `Revision ${wanted} is outdated (queue is at revision ${state.revision}); a newer validation run handles it.`;
+    console.log(msg);
+    return summary(`# Queue Validation\n\n${msg}`);
   }
 
-  // Refresh every active PR: closed/merged PRs leave, drafts/retargeted PRs block, new heads are shown.
-  for (const e of activeEntries(state)) {
-    const pr = await refreshEntry(e, notes);
+  // Re-check every queued PR: closed PRs leave, new commits pop out, drafts are blocked.
+  for (const e of queueEntries(state)) {
     touched.add(e.number);
-    if (pr && (pr.draft || pr.base.ref !== BASE) && !BLOCKING.has(e.state)) {
+    const pr = await refreshEntry(e, notes);
+    if (pr && IN_QUEUE.has(e.state) && (pr.draft || pr.base.ref !== BASE)) {
       transition(e, 'BLOCKED', {
         state_reason: pr.draft ? 'PR is a draft' : `PR targets ${pr.base.ref}`,
       });
     }
   }
 
-  const { prs, blockers } = composition(state);
-  if (blockers.length || !prs.length) {
-    await save(ctx, touched);
-    if (!prs.length && !blockers.length)
-      return reject(
-        ['Nothing to build: the active queue has no buildable PRs.', ...notes].join('\n\n'),
+  // Newest candidate wins: cancel the outdated one.
+  const cc = state.current_candidate;
+  if (cc?.status === 'VALIDATING') {
+    const run = await findCandidateRun(cc.id, cc.started_at);
+    if (run && run.status !== 'completed') {
+      await api('POST', `${REPO}/actions/runs/${run.id}/cancel`).catch((err) =>
+        console.log(`::warning::Could not cancel run ${run.id}: ${err.message}`),
       );
-    const b = refs(blockers.map((e) => e.number));
-    return reject(
-      [
-        `Build rejected: ${blockers.map((e) => `#${e.number} is ${e.state}`).join(', ')}. The queue is never changed automatically.`,
-        `Suggested next candidate if ${b} ${blockers.length > 1 ? 'are' : 'is'} held: **${refs(prs.map((e) => e.number)) || '(empty)'}**`,
-        `Available actions on ${b}: \`/queue hold\`, \`/queue retry\`, \`/queue remove\` (on the PR, or here with \`#PR\`).`,
-        ...notes,
-      ].join('\n\n'),
-    );
+    }
+    Object.assign(cc, {
+      status: 'SUPERSEDED',
+      finished_at: new Date().toISOString(),
+      note: `Superseded by queue revision ${state.revision}.`,
+    });
+    notes.push(`Cancelled outdated candidate ${cc.id}.`);
   }
 
-  const id = explicitId ?? nextCandidateId(state);
+  const prs = queueEntries(state);
+  if (!prs.length) {
+    recordHistory(state, {
+      op: 'VALIDATE',
+      by: 'queue',
+      detail: 'queue empty, nothing to validate',
+    });
+    await save(ctx, touched);
+    return summary(
+      ['# Queue Validation', 'The queue is empty; nothing to validate.', ...notes].join('\n\n'),
+    );
+  }
+  const id = nextCandidateId(state);
   const numbers = prs.map((e) => e.number);
-  const previous = new Map(prs.map((e) => [e.number, e.state]));
   for (const e of prs) {
     transition(e, 'VALIDATING');
     touched.add(e.number);
   }
   state.current_candidate = {
     id,
+    revision: state.revision,
+    reason,
     prs: numbers,
     shas: Object.fromEntries(prs.map((e) => [e.number, e.head_sha])),
     status: 'VALIDATING',
-    requested_by: op.by,
     started_at: new Date().toISOString(),
     finished_at: null,
     run_url: null,
     first_failing_pr: null,
     passed_prs: [],
   };
-  recordHistory(state, { op: 'BUILD', by: op.by, detail: `${id}: ${refs(numbers)}` });
-  op.message = `Candidate **${id}**: ${queueLine(prs)}`;
+  recordHistory(state, {
+    op: 'VALIDATE',
+    by: 'queue',
+    detail: `${id}: ${refs(numbers)} (${reason})`,
+  });
   await save(ctx, touched);
 
   try {
     await api('POST', `${REPO}/actions/workflows/${CANDIDATE_WORKFLOW}/dispatches`, {
-      ref: ev.repository?.default_branch ?? BASE,
+      ref: REF,
       inputs: { candidate_id: id, prs: numbers.join(',') },
     });
   } catch (err) {
-    for (const e of prs) transition(e, previous.get(e.number));
+    for (const e of prs) transition(e, 'QUEUED');
     Object.assign(state.current_candidate, {
       status: 'DISPATCH_FAILED',
       note: err.message,
       finished_at: new Date().toISOString(),
     });
     await save(ctx, touched);
-    return reject(`Could not dispatch the candidate builder: ${err.message}`);
+    throw new Error(`Could not dispatch the candidate builder: ${err.message}`);
   }
-  // The await-candidate job picks this up and waits for the run to finish.
-  if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `candidate_id=${id}\n`);
-  const runs = `${SERVER}/${process.env.GITHUB_REPOSITORY}/actions/workflows/${CANDIDATE_WORKFLOW}`;
-  return finish(
+  output('candidate_id', id);
+  summary(
     [
-      `Candidate **${id}** dispatched with ${queueLine(prs)} (\`prs=${numbers.join(',')}\`).`,
-      `Follow it in [Actions](${runs}). This issue and the PRs update when it finishes.`,
+      '# Queue Validation',
+      `**Candidate:** ${id} (queue revision ${state.revision})`,
+      `**Reason:** ${reason}`,
+      `**Queue:** ${queueLine(prs)}`,
       ...notes,
     ].join('\n\n'),
   );
+}
+
+/** QUEUE_MODE=await: wait for the candidate run; stop early if a newer candidate replaced it. */
+async function awaitCandidate() {
+  const candidateId = process.env.CANDIDATE_ID;
+  const pollMs = Number(process.env.QUEUE_POLL_SECONDS ?? 20) * 1000;
+  const deadline = Date.now() + 50 * 60 * 1000;
+  for (;;) {
+    const cc = (await loadQueue({ create: false }))?.state.current_candidate;
+    if (cc?.id !== candidateId || cc.status !== 'VALIDATING') {
+      return console.log(
+        `Candidate ${candidateId} is no longer current (${cc?.id}: ${cc?.status}).`,
+      );
+    }
+    const run = await findCandidateRun(candidateId, cc.started_at);
+    if (run?.status === 'completed') {
+      console.log(`Candidate run ${run.id} (${run.display_title}) finished: ${run.conclusion}.`);
+      return output('run_id', run.id);
+    }
+    if (Date.now() > deadline)
+      throw new Error(`Gave up waiting for ${candidateId} after 50 minutes.`);
+    console.log(
+      run
+        ? `Run ${run.id} is ${run.status}; waiting…`
+        : `Waiting for the ${candidateId} run to appear…`,
+    );
+    await sleep(pollMs);
+  }
+}
+
+/** Validates a run id and returns the candidate-builder run. */
+async function candidateRun(id) {
+  const run = await api('GET', `${REPO}/actions/runs/${id}`, null, { allow404: true });
+  if (!run) throw new Error(`Run ${id} was not found.`);
+  // `run.name` is the run's display name when the workflow sets run-name; `path` identifies it.
+  if (run.path?.split('@')[0] !== `.github/workflows/${CANDIDATE_WORKFLOW}`) {
+    throw new Error(`Run ${id} is not a "${BUILDER_NAME}" run (${run.path}).`);
+  }
+  return run;
 }
 
 // ---- Candidate results ----
@@ -630,6 +781,7 @@ async function readResult(run, cc) {
   };
 }
 
+/** QUEUE_MODE=record: apply a finished candidate run to the queue. */
 async function handleResult(run) {
   const id = /^Candidate (\S+) \(PRs /.exec(run.display_title ?? '')?.[1];
   const ctx = await loadQueue({ create: false });
@@ -641,21 +793,29 @@ async function handleResult(run) {
   }
   cc.run_url = run.html_url;
   const result = { ...(await readResult(run, cc)), run_url: run.html_url };
-  applyResult(ctx.state, result);
+  const { revalidate } = applyResult(ctx.state, result);
   recordHistory(ctx.state, {
     op: 'RESULT',
     by: 'candidate-builder',
     detail: `${id}: ${result.status}`,
   });
+  const touched = new Set(cc.prs);
+  if (revalidate) {
+    const why = result.first_failing_pr
+      ? `#${result.first_failing_pr} ejected (${result.status} in ${id})`
+      : `${id} was ${result.status}`;
+    requestValidation(ctx, why, touched);
+  }
 
   // Supplementary annotations on this run.
   const d = result.detail;
   if (d?.type === 'MERGE_CONFLICT') {
     const peers = d.direct_conflicts_with.length ? ` with PR ${refs(d.direct_conflicts_with)}` : '';
-    for (const f of d.conflicting_files)
+    for (const f of d.conflicting_files) {
       console.log(
         `::error file=${f}::PR #${result.first_failing_pr} conflicts${peers} in release candidate ${id}`,
       );
+    }
   }
   if (d?.type === 'TEST_FAILED') {
     for (const f of new Set([d.throw_site, ...d.failed_tests.map((t) => t.file)].filter(Boolean))) {
@@ -664,17 +824,18 @@ async function handleResult(run) {
       );
     }
   }
-  await save(ctx, new Set(cc.prs));
+  await save(ctx, touched);
   summary(renderResultSummary(ctx.state));
 }
 
-// ---- PR lifecycle ----
+// ---- PR and main changes ----
 async function handlePrEvent() {
   const pr = ev.pull_request;
   const ctx = await loadQueue({ create: false });
   const entry = ctx && findEntry(ctx.state, pr.number);
   if (!entry || INACTIVE.has(entry.state))
     return console.log(`PR #${pr.number} is not in the queue.`);
+  const before = signature(ctx.state);
   const op = {
     name: `pr ${ev.action}`,
     by: ev.sender?.login ?? 'unknown',
@@ -686,109 +847,54 @@ async function handlePrEvent() {
       state_reason: pr.merged ? 'merged outside the queue' : 'PR closed without merging',
     });
   } else {
-    const before = entry.head_sha;
+    const from = entry.head_sha;
     if (!applyNewRevision(entry, pr.head.sha)) return console.log('Head SHA unchanged.');
-    op.message = `NEW_REVISION: \`${short(before)}\` → \`${short(pr.head.sha)}\``;
+    op.message = `NEW_REVISION: \`${short(from)}\` → \`${short(pr.head.sha)}\``;
   }
   entry.title = pr.title;
   op.next = entry.state;
+  const touched = new Set([pr.number]);
   recordHistory(ctx.state, {
     op: `PR ${ev.action.toUpperCase()}`,
     pr: pr.number,
     by: op.by,
     detail: op.message ?? entry.state,
   });
-  await save(ctx, new Set([pr.number]));
+  revalidateIfChanged(
+    ctx,
+    before,
+    `PR #${pr.number} ${ev.action === 'closed' ? 'closed' : 'has new commits'}`,
+    touched,
+  );
+  await save(ctx, touched);
   summary(renderOperationSummary(ctx.state, op));
 }
 
-// ---- Waiting for a candidate run ----
-// Runs started with GITHUB_TOKEN (our dispatch) do not emit workflow_run events, so the queue
-// manager waits for its own candidate run instead, in a job that holds no queue lock.
-const BUILDER_NAME = 'POC - Build Release Candidate';
-const RUN_HELP =
-  'Use the candidate-builder run id: the number after /actions/runs/ in the URL of a ' +
-  `"${BUILDER_NAME}" run (or paste that URL), or leave it empty for the current candidate.`;
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-const POLL_MS = Number(process.env.QUEUE_POLL_SECONDS ?? 20) * 1000;
-const WAIT_LIMIT_MS = 50 * 60 * 1000;
-
-/** Validates a run id or run URL (…/actions/runs/<id>[/job/…]) and returns the run. */
-async function runFromInput(input) {
-  const id = /^\d+/.exec(String(input).trim().split('/runs/').at(-1))?.[0];
-  if (!id) throw new Error(`"${input}" is not a run id. ${RUN_HELP}`);
-  const run = await api('GET', `${REPO}/actions/runs/${id}`, null, { allow404: true });
-  if (!run) throw new Error(`Run ${id} was not found in this repository. ${RUN_HELP}`);
-  // `run.name` is the run's display name when the workflow sets run-name; `path` identifies it.
-  if (run.path?.split('@')[0] !== `.github/workflows/${CANDIDATE_WORKFLOW}`) {
-    throw new Error(`Run ${id} is not a "${BUILDER_NAME}" run (${run.path}). ${RUN_HELP}`);
-  }
-  return run;
-}
-
-/**
- * Latest candidate-builder run for a candidate id (matched by its run name), or null.
- * Runs created before `notBefore` are ignored, so an older run reusing the id is never picked.
- */
-async function findCandidateRun(candidateId, notBefore) {
-  const earliest = notBefore ? Date.parse(notBefore) - 60_000 : 0; // allow for clock skew
-  const { workflow_runs: runs } = await api(
-    'GET',
-    `${REPO}/actions/workflows/${CANDIDATE_WORKFLOW}/runs?event=workflow_dispatch&per_page=30`,
+async function handlePush() {
+  const ctx = await loadQueue({ create: false });
+  if (!ctx || !queueEntries(ctx.state).length)
+    return console.log('Queue is empty; nothing to revalidate.');
+  const touched = new Set();
+  requestValidation(ctx, `main updated to ${short(ev.after)}`, touched);
+  await save(ctx, touched);
+  summary(
+    renderOperationSummary(ctx.state, {
+      name: 'main updated',
+      by: ev.pusher?.name ?? ACTOR,
+      message: `Revalidating the queue on \`${short(ev.after)}\`.`,
+    }),
   );
-  return (
-    runs
-      .filter((r) => r.display_title?.startsWith(`Candidate ${candidateId} (`))
-      .filter((r) => Date.parse(r.created_at) >= earliest)
-      .sort((a, b) => b.created_at.localeCompare(a.created_at))[0] ?? null
-  );
-}
-
-/**
- * Waits until the candidate run is finished and outputs its id for the job that records it.
- * Uses RUN_INPUT (id/URL) if given, else CANDIDATE_ID, else the queue's validating candidate.
- */
-async function awaitCandidate() {
-  const input = process.env.RUN_INPUT?.trim();
-  let candidateId = process.env.CANDIDATE_ID?.trim();
-  const cc = input ? null : (await loadQueue({ create: false }))?.state.current_candidate;
-  if (!input && !candidateId) {
-    if (cc?.status !== 'VALIDATING') {
-      const msg = `No candidate is validating (${cc ? `${cc.id}: ${cc.status}` : 'none'}); nothing to wait for.`;
-      console.log(msg);
-      return summary(`# Candidate Result\n\n${msg}`);
-    }
-    candidateId = cc.id;
-  }
-  const deadline = Date.now() + WAIT_LIMIT_MS;
-  for (;;) {
-    const notBefore = cc && cc.id === candidateId ? cc.started_at : null;
-    const run = input ? await runFromInput(input) : await findCandidateRun(candidateId, notBefore);
-    if (run?.status === 'completed') {
-      console.log(`Candidate run ${run.id} (${run.display_title}) finished: ${run.conclusion}.`);
-      if (process.env.GITHUB_OUTPUT)
-        appendFileSync(process.env.GITHUB_OUTPUT, `run_id=${run.id}\n`);
-      return;
-    }
-    if (Date.now() > deadline) {
-      throw new Error(`Gave up waiting for candidate ${candidateId ?? input} after 50 minutes.`);
-    }
-    console.log(
-      run
-        ? `Run ${run.id} is ${run.status}; waiting…`
-        : `Waiting for the ${candidateId} run to appear…`,
-    );
-    await sleep(POLL_MS);
-  }
 }
 
 // ---- Entry point ----
 try {
-  if (process.env.QUEUE_MODE === 'await') await awaitCandidate();
-  else if (process.env.QUEUE_MODE === 'record')
-    await handleResult(await runFromInput(process.env.RESULT_RUN_ID));
+  const mode = process.env.QUEUE_MODE;
+  if (mode === 'start') await startCandidate();
+  else if (mode === 'await') await awaitCandidate();
+  else if (mode === 'record') await handleResult(await candidateRun(process.env.RESULT_RUN_ID));
   else if (EVENT === 'issue_comment') await handleComment();
   else if (EVENT === 'pull_request') await handlePrEvent();
+  else if (EVENT === 'push') await handlePush();
   else console.log(`Unhandled event ${EVENT}.`);
 } catch (err) {
   console.log(`::error::${err.message}`);

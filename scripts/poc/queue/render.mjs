@@ -1,9 +1,9 @@
 // Markdown for the queue dashboard issue, PR sticky comments and job summaries.
 import {
-  activeEntries,
-  composition,
+  EJECTED,
   INACTIVE,
   positionOf,
+  queueEntries,
   queueLine,
   serializeState,
 } from './queue.mjs';
@@ -22,6 +22,8 @@ const BADGES = {
   STALE_PR: '⚠️ STALE_PR',
   STALE_MAIN: '⚠️ STALE_MAIN',
   BLOCKED: '⛔ BLOCKED',
+  SUPERSEDED: '⏭️ SUPERSEDED',
+  CANCELLED: '⏹️ CANCELLED',
   REMOVED: '🗑️ REMOVED',
   MERGED: '🟣 MERGED',
 };
@@ -88,7 +90,7 @@ function candidateLines(cc) {
   ];
   lines.push(
     '',
-    `Started ${time(cc.started_at)} by @${cc.requested_by}${cc.finished_at ? ` · finished ${time(cc.finished_at)}` : ''}${cc.run_url ? ` · [run](${cc.run_url})` : ''}`,
+    `Queue revision ${cc.revision ?? '—'} · started ${time(cc.started_at)}${cc.reason ? ` (${cell(cc.reason)})` : ''}${cc.finished_at ? ` · finished ${time(cc.finished_at)}` : ''}${cc.run_url ? ` · [run](${cc.run_url})` : ''}`,
   );
   if (cc.status === 'VALIDATED') {
     lines.push(
@@ -135,8 +137,8 @@ function validationLines(cc) {
 }
 
 export function renderDashboard(state, meta = {}) {
-  const active = activeEntries(state);
-  const { prs, blockers, validating } = composition(state);
+  const queued = queueEntries(state);
+  const ejected = state.entries.filter((e) => EJECTED.has(e.state));
   const held = state.entries.filter((e) => e.state === 'HELD');
   const ready = state.entries.filter((e) => e.state === 'READY');
   const inactive = state.entries
@@ -145,24 +147,24 @@ export function renderDashboard(state, meta = {}) {
     .reverse();
   const md = [`# ${QUEUE_TITLE}`, ''];
   md.push(
-    '> Managed by the **POC Queue Manager** workflow. Comment `/queue …` commands on this issue or on a PR. Do not edit this description by hand: the queue state is stored in it.',
+    '> Managed by the **POC Queue Manager** workflow. The queue revalidates itself whenever it or `main` changes. Comment `/queue …` commands on this issue or on a PR. Do not edit this description by hand: the queue state is stored in it.',
     '',
   );
   md.push(
-    `**Queue status:** ${state.frozen ? `🧊 FROZEN (by @${state.frozen_by}, ${time(state.frozen_at)})` : '🟢 OPEN'}`,
+    `**Queue status:** ${state.frozen ? `🧊 FROZEN (by @${state.frozen_by}, ${time(state.frozen_at)})` : '🟢 OPEN'} · revision ${state.revision}`,
     '',
   );
   md.push(`**Last updated:** ${time(meta.now ?? new Date().toISOString())}`, '');
 
   md.push('## Current candidate', '', ...candidateLines(state.current_candidate), '');
 
-  md.push('## Active queue', '');
-  if (active.length) {
+  md.push('## Queue', '');
+  if (queued.length) {
     md.push(
       '| Pos | PR | Title | Author | Head SHA | State | Last result |',
       '|---|---|---|---|---|---|---|',
     );
-    active.forEach((e, i) => {
+    queued.forEach((e, i) => {
       const last = e.last_result
         ? `${e.last_result}${e.last_candidate ? ` (${e.last_candidate})` : ''}`
         : 'waiting';
@@ -171,43 +173,24 @@ export function renderDashboard(state, meta = {}) {
       );
     });
   } else {
-    md.push('_No PRs in the active queue._');
+    md.push('_The queue is empty._');
   }
   md.push('');
 
-  if (blockers.length) {
-    md.push('## Current blocker' + (blockers.length > 1 ? 's' : ''), '');
-    for (const b of blockers) {
+  if (ejected.length) {
+    md.push(
+      '## Ejected — needs action',
+      '',
+      'These PRs are out of the queue and are not validated until re-entered: `/queue retry` returns a PR to its previous place, `/queue add` puts it at the end, `/queue remove` drops it.',
+      '',
+    );
+    for (const e of ejected) {
       md.push(
-        `**#${b.number} ${cell(b.title)}** — ${badge(b.state)}${b.state_reason ? ` (${b.state_reason})` : ''}`,
+        `**#${e.number} ${cell(e.title)}** (@${e.author}) — ${badge(e.state)}${e.state_reason ? ` (${e.state_reason})` : ''} · ${short(e.head_sha)}${revision(e)}`,
       );
-      md.push(...detailLines(b.result_detail, b.number), '');
+      md.push(...detailLines(e.result_detail, e.number), '');
     }
   }
-
-  md.push('## Next candidate', '');
-  if (validating.length) {
-    md.push(
-      `A candidate is validating (${refs(validating.map((e) => e.number))}); wait for its result before building again.`,
-    );
-  } else if (blockers.length) {
-    md.push(
-      `\`/queue build\` is blocked by ${refs(blockers.map((e) => e.number))}. The queue is never changed automatically.`,
-      '',
-    );
-    md.push(
-      `Suggested next candidate if ${refs(blockers.map((e) => e.number))} ${blockers.length > 1 ? 'are' : 'is'} held: **${refs(prs.map((e) => e.number)) || '(empty)'}**`,
-      '',
-    );
-    md.push(
-      `Available actions on ${refs(blockers.map((e) => e.number))}: \`/queue hold\` · \`/queue retry\` · \`/queue remove\``,
-    );
-  } else if (prs.length) {
-    md.push(`If \`/queue build\` ran now: **${refs(prs.map((e) => e.number))}**`);
-  } else {
-    md.push('Nothing to build.');
-  }
-  md.push('');
 
   if (held.length) {
     md.push('## Held', '', '| PR | Title | Author | Head SHA | Since |', '|---|---|---|---|---|');
@@ -248,7 +231,7 @@ export function renderDashboard(state, meta = {}) {
     '',
   );
   md.push(
-    'On this issue: `/queue status` · `/queue build [rc-id]` · `/queue freeze` · `/queue unfreeze` · `/queue move #PR POS` · `/queue hold #PR` (and the other PR commands with `#PR`)',
+    'On this issue: `/queue status` · `/queue revalidate` · `/queue freeze` · `/queue unfreeze` · `/queue move #PR POS` · `/queue hold #PR` (and the other PR commands with `#PR`)',
     '',
   );
   md.push(serializeState(state));
@@ -264,11 +247,11 @@ export function renderPrComment(state, entry, meta = {}) {
     '',
   );
   const pos = positionOf(state, entry.number);
-  if (pos) md.push(`**Queue position:** ${pos} of ${activeEntries(state).length}`, '');
+  if (pos) md.push(`**Queue position:** ${pos} of ${queueEntries(state).length}`, '');
   md.push(`**Head SHA:** ${short(entry.head_sha)}${revision(entry)}`, '');
   md.push(
     `**Queue:** ${
-      activeEntries(state)
+      queueEntries(state)
         .map((e) => (e.number === entry.number ? `**#${e.number}**` : `#${e.number}`))
         .join(' → ') || '(empty)'
     }`,
@@ -281,6 +264,12 @@ export function renderPrComment(state, entry, meta = {}) {
     );
 
   switch (entry.state) {
+    case 'QUEUED':
+      md.push(
+        'Waiting for the next candidate: the queue changed, so it is revalidated automatically in a moment.',
+        '',
+      );
+      break;
     case 'VALIDATING':
       md.push(
         `Candidate **${cc.id}** is currently validating.`,
@@ -300,14 +289,15 @@ export function renderPrComment(state, entry, meta = {}) {
     case 'TEST_FAILED':
     case 'MERGE_CONFLICT':
     case 'BLOCKED':
-      if (inCandidate && cc.first_failing_pr === entry.number) {
+      if (entry.failure) {
+        const f = entry.failure;
         md.push(
-          `**First failing addition:** #${entry.number} in ${cc.id}`,
+          `**First failing addition:** #${entry.number} in ${f.candidate}`,
           '',
-          `**Passed prefix:** ${refs(cc.passed_prs) || 'none'}`,
+          `**Passed prefix:** ${refs(f.passed_prs) || 'none'}`,
           '',
         );
-        md.push('**Combined validation:**', '', ...validationLines(cc), '');
+        md.push('**Combined validation:**', '', ...validationLines(f), '');
         md.push(
           `PR #${entry.number} is the first addition after which the candidate failed; the cause may be this PR or an interaction with earlier PRs.`,
           '',
@@ -315,19 +305,17 @@ export function renderPrComment(state, entry, meta = {}) {
       }
       md.push(...detailLines(entry.result_detail, entry.number), '');
       md.push(
-        '**Suggested action:** fix this PR (or coordinate with the related PR authors), push the fix, then `/queue retry`. Or `/queue hold` / `/queue remove` to take it out of the next candidate.',
+        '**Ejected from the queue.** The rest of the queue is validated without this PR.',
+        '',
+        '**Suggested action:** fix this PR (or coordinate with the related PR authors) and push the fix, then `/queue retry` to return to your previous place or `/queue add` to rejoin at the end.',
         '',
       );
       break;
     case 'STALE_PR':
       md.push(
-        'This PR changed while its candidate was validating, so the result was not accepted. Use `/queue retry` to queue the new revision.',
+        '**New commits were pushed, so this PR left the queue** (its validation no longer matches the code). The rest of the queue is revalidated without it.',
         '',
-      );
-      break;
-    case 'STALE_MAIN':
-      md.push(
-        '`main` changed while the candidate was validating. The PR stays queued; the next `/queue build` uses the latest main.',
+        '`/queue retry` returns it to its previous place with the new revision; `/queue add` rejoins at the end.',
         '',
       );
       break;
@@ -347,13 +335,6 @@ export function renderPrComment(state, entry, meta = {}) {
         '',
       );
       break;
-    default:
-      md.push(
-        entry.last_result
-          ? `**Last result:** ${entry.last_result}`
-          : '**Last validation:** waiting for the next candidate',
-        '',
-      );
   }
   const commands =
     {
@@ -364,7 +345,7 @@ export function renderPrComment(state, entry, meta = {}) {
       READY: '/queue status · /queue remove',
       REMOVED: '/queue add',
       MERGED: '/queue status',
-    }[entry.state] ?? '/queue retry · /queue hold · /queue remove · /queue status';
+    }[entry.state] ?? '/queue retry · /queue add · /queue remove · /queue status';
   md.push(
     `**Commands:** ${commands
       .split(' · ')
@@ -384,7 +365,7 @@ export function renderStatus(state, entry) {
     lines.push(`**PR #${entry.number}** — ${badge(entry.state)}`, '');
     const pos = positionOf(state, entry.number);
     lines.push(
-      `- Position: ${pos ?? 'not in the active queue'}`,
+      `- Position: ${pos ?? 'not in the queue'}`,
       `- Head SHA: ${short(entry.head_sha)}${revision(entry)}`,
     );
     lines.push(
@@ -393,8 +374,12 @@ export function renderStatus(state, entry) {
   }
   const cc = state.current_candidate;
   lines.push(`- Current candidate: ${cc ? `${cc.id} (${cc.status})` : 'none'}`);
-  lines.push(`- Active queue: ${queueLine(activeEntries(state))}`);
+  lines.push(`- Queue: ${queueLine(queueEntries(state))}`);
   const held = state.entries.filter((e) => e.state === 'HELD');
+  const ejected = state.entries.filter((e) => EJECTED.has(e.state));
+  lines.push(
+    `- Ejected: ${ejected.length ? ejected.map((e) => `#${e.number} (${e.state})`).join(', ') : 'none'}`,
+  );
   lines.push(`- Held: ${held.length ? refs(held.map((e) => e.number)) : 'none'}`);
   lines.push(`- Queue frozen: ${state.frozen ? 'Yes' : 'No'}`);
   return lines.join('\n');
@@ -410,7 +395,7 @@ export function renderOperationSummary(state, op) {
     op.prev ? `**Previous state:** ${op.prev}` : null,
     op.next ? `**New state:** ${op.next}` : null,
     op.message ? `\n${op.message}\n` : null,
-    `**Current active queue:** ${queueLine(activeEntries(state))}`,
+    `**Queue:** ${queueLine(queueEntries(state))}`,
     `**Held:** ${held.length ? refs(held.map((e) => e.number)) : 'none'}`,
     `**Queue frozen:** ${state.frozen ? 'Yes' : 'No'}`,
   ]
@@ -434,7 +419,7 @@ export function renderResultSummary(state) {
     '**Queue:**',
     cc.prs.map((n, i) => `- #${n} ${icon(i)}`).join('\n'),
     cc.note ? `**Note:** ${cc.note}` : null,
-    `**Active queue now:** ${queueLine(activeEntries(state))}`,
+    `**Queue now:** ${queueLine(queueEntries(state))}`,
   ]
     .filter((l) => l !== null)
     .join('\n\n');
