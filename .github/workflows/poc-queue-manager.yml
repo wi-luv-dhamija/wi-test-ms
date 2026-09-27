@@ -42,7 +42,7 @@ on:
   workflow_dispatch:
     inputs:
       result_run_id:
-        description: 'Candidate-builder run id to process'
+        description: 'Candidate-builder run id or run URL (…/actions/runs/<id>), not the PR or run number'
         required: true
         type: string
 
@@ -104,8 +104,11 @@ jobs:
         if: github.event_name == 'workflow_run' || github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ github.event.workflow_run.id || inputs.result_run_id }}
+          RUN_INPUT: ${{ github.event.workflow_run.id || inputs.result_run_id }}
         run: |
+          # Accept a bare id or a run URL; the queue manager step validates it and explains errors.
+          RUN_ID=$(sed -E 's#.*/runs/##' <<<"$RUN_INPUT" | grep -oE '^[0-9]+' || true)
+          [ -n "$RUN_ID" ] || { echo "Not a run id: $RUN_INPUT"; exit 0; }
           gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/candidate-artifacts" \
             || echo "No artifacts for run $RUN_ID; the result is derived from the run's steps."
 

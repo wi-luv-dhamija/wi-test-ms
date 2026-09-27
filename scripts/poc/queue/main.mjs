@@ -698,12 +698,28 @@ async function handlePrEvent() {
   summary(renderOperationSummary(ctx.state, op));
 }
 
+/** Manual re-processing: accepts a run id or a run URL (…/actions/runs/<id>[/job/…]). */
+async function handleManualResult(input) {
+  const id = /^\d+/.exec(String(input).trim().split('/runs/').at(-1))?.[0];
+  const help =
+    'Use the candidate-builder run id: the number after /actions/runs/ in the URL of a ' +
+    '"POC - Build Release Candidate" run (or paste that URL).';
+  if (!id) throw new Error(`"${input}" is not a run id. ${help}`);
+  const run = await api('GET', `${REPO}/actions/runs/${id}`, null, { allow404: true });
+  if (!run) throw new Error(`Run ${id} was not found in this repository. ${help}`);
+  if (run.name !== 'POC - Build Release Candidate') {
+    throw new Error(`Run ${id} is a "${run.name}" run, not a candidate-builder run. ${help}`);
+  }
+  if (run.status !== 'completed')
+    throw new Error(`Run ${id} has not finished yet (${run.status}).`);
+  await handleResult(run);
+}
+
 // ---- Entry point ----
 try {
   if (EVENT === 'issue_comment') await handleComment();
   else if (EVENT === 'workflow_run') await handleResult(ev.workflow_run);
-  else if (EVENT === 'workflow_dispatch')
-    await handleResult(await api('GET', `${REPO}/actions/runs/${ev.inputs.result_run_id}`));
+  else if (EVENT === 'workflow_dispatch') await handleManualResult(ev.inputs.result_run_id);
   else if (EVENT === 'pull_request') await handlePrEvent();
   else console.log(`Unhandled event ${EVENT}.`);
 } catch (err) {
