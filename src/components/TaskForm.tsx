@@ -1,5 +1,6 @@
 import { useState, type FormEvent } from 'react';
 import { TASK_PRIORITIES, TASK_STATUSES, type TaskInput } from '../types/task';
+import { createAssignee } from '../utils/assignee';
 import styles from './TaskForm.module.css';
 
 const emptyTask: TaskInput = {
@@ -7,7 +8,7 @@ const emptyTask: TaskInput = {
   description: '',
   status: 'Pending',
   priority: 'Medium',
-  assignee: '',
+  assignee: { id: '', name: '' },
 };
 
 interface TaskFormProps {
@@ -30,14 +31,19 @@ export function TaskForm({
 
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault();
-    const trimmed = {
+    const title = values.title.trim();
+    const assigneeName = values.assignee.name.trim();
+    if (!title || !assigneeName) return;
+    onSubmit({
       ...values,
-      title: values.title.trim(),
+      title,
       description: values.description.trim(),
-      assignee: values.assignee.trim(),
-    };
-    if (!trimmed.title || !trimmed.assignee) return;
-    onSubmit(trimmed);
+      // Keep the existing assignee (and its id) unless the name was changed.
+      assignee:
+        assigneeName === initialValues.assignee.name
+          ? initialValues.assignee
+          : createAssignee(assigneeName),
+    });
   };
 
   return (
@@ -78,7 +84,11 @@ export function TaskForm({
       </label>
       <label className={styles.field}>
         Assignee
-        <input required value={values.assignee} onChange={(e) => set('assignee', e.target.value)} />
+        <input
+          required
+          value={values.assignee.name}
+          onChange={(e) => set('assignee', { ...values.assignee, name: e.target.value })}
+        />
       </label>
       <div className={styles.actions}>
         <button type="button" className="btn" onClick={onCancel}>

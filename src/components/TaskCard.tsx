@@ -22,7 +22,7 @@ export function TaskCard({ task, onStatusChange, onEdit, onDelete }: TaskCardPro
         <dt>Priority</dt>
         <dd className={task.priority === 'High' ? styles.high : undefined}>{task.priority}</dd>
         <dt>Assignee</dt>
-        <dd>{task.assignee}</dd>
+        <dd>{task.assignee.name}</dd>
         <dt>Created</dt>
         <dd>{formatDate(task.createdAt)}</dd>
       </dl>
