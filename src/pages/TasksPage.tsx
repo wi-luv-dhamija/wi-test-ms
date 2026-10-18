@@ -1,14 +1,18 @@
 import { useState } from 'react';
 import { TaskCard } from '../components/TaskCard';
 import { TaskForm } from '../components/TaskForm';
+import { TaskSearch } from '../components/TaskSearch';
 import { useTasks } from '../hooks/useTasks';
 import type { Task } from '../types/task';
+import { searchTasks } from '../utils/taskSearch';
 import styles from './TasksPage.module.css';
 
 export function TasksPage() {
   const { tasks, addTask, updateTask, changeStatus, deleteTask } = useTasks();
   const [isCreating, setIsCreating] = useState(false);
   const [editing, setEditing] = useState<Task | null>(null);
+  const [query, setQuery] = useState('');
+  const visibleTasks = searchTasks(tasks, query);
 
   const closeForm = () => {
     setIsCreating(false);
@@ -50,11 +54,15 @@ export function TasksPage() {
         />
       )}
 
+      <TaskSearch value={query} onChange={setQuery} />
+
       {tasks.length === 0 ? (
         <p className="muted">No tasks yet. Add one to get started.</p>
+      ) : visibleTasks.length === 0 ? (
+        <p className="muted">No tasks match your search.</p>
       ) : (
         <div className={styles.grid}>
-          {tasks.map((task) => (
+          {visibleTasks.map((task) => (
             <TaskCard
               key={task.id}
               task={task}
