@@ -1,0 +1,123 @@
+name: POC - Release
+run-name: Merge PRs ${{ inputs.prs }} (tested as ${{ inputs.tag }}) to main
+
+# Merges the QA-approved PRs to main in queue order. `/merge qa` on the QA queue issue dispatches
+# it with the approved prefix of the queue; it can also be run by hand.
+#
+# A QA candidate is main + #A + #B + #C as one merge commit per PR, and every prefix of it was
+# checked. Merging #A, #B therefore fast-forwards main to the candidate's second merge commit:
+# the exact tested commits, no new merge. GitHub marks those PRs merged. The merge is then tagged
+# `YYYY.MM.DD.N` (Asia/Kolkata date) and deployed. The `production` environment can hold an extra
+# approval gate (required reviewers in Settings → Environments).
+# Pushes by GITHUB_TOKEN don't trigger workflows, so the queues are told to drop the merged PRs
+# and revalidate on the new main.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Deployed QA tag the PRs were tested in, e.g. qa/rc-42'
+        required: true
+        type: string
+      prs:
+        description: 'PRs to merge, in queue order: the first N PRs of that tag, e.g. 12,15'
+        required: true
+        type: string
+
+permissions:
+  contents: write # fast-forward main, push the release tag
+  actions: write # dispatch queue revalidation
+
+concurrency:
+  group: poc-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Merge ${{ inputs.prs }} to main
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    env:
+      QA_TAG: ${{ inputs.tag }}
+      PRS_INPUT: ${{ inputs.prs }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Walks the candidate's merge commits (first parent = previous state, second parent = the
+      # PR head) and picks the one that adds the last requested PR.
+      - name: Find the tested commit for these PRs
+        run: |
+          if [[ ! "$QA_TAG" =~ ^qa/rc-[0-9]+$ ]]; then
+            echo "::error::Only QA candidate tags (qa/rc-N) can be merged, got '$QA_TAG'."
+            exit 1
+          fi
+          prs="${PRS_INPUT//[[:space:]]/}"
+          if [[ ! "$prs" =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]]; then
+            echo "::error::prs must be a comma-separated list of PR numbers, got '$PRS_INPUT'."
+            exit 1
+          fi
+          tip=$(git rev-parse --verify --quiet "refs/tags/$QA_TAG^{commit}") ||
+            { echo "::error::Tag $QA_TAG does not exist."; exit 1; }
+          if ! git merge-base --is-ancestor origin/main "$tip"; then
+            echo "::error::main moved since $QA_TAG was built. Wait for the QA queue to redeploy on the new main, then /merge qa again."
+            exit 1
+          fi
+          IFS=, read -ra wanted <<<"$prs"
+          mapfile -t merges < <(git rev-list --first-parent --reverse "origin/main..$tip")
+          if ((${#wanted[@]} > ${#merges[@]})); then
+            echo "::error::$QA_TAG contains ${#merges[@]} PR(s); ${#wanted[@]} requested."
+            exit 1
+          fi
+          for i in "${!wanted[@]}"; do
+            c=${merges[$i]}
+            n=$(git log -1 --format=%s "$c" | sed -nE 's/^Candidate .*: add PR #([0-9]+) .*/\1/p')
+            if [[ "$n" != "${wanted[$i]}" ]]; then
+              echo "::error::PR #${wanted[$i]} is not at position $((i + 1)) of $QA_TAG (found #${n:-?}). Merge only from the front of the queue, in order."
+              exit 1
+            fi
+            head=$(git rev-parse "$c^2")
+            current=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$n" --jq .head.sha)
+            if [[ "$current" != "$head" ]]; then
+              echo "::error::PR #$n has new commits since $QA_TAG was tested ($head → $current)."
+              exit 1
+            fi
+            echo "PR #$n  head $head  merged as $c"
+          done
+          echo "SHA=${merges[$((${#wanted[@]} - 1))]}" >>"$GITHUB_ENV"
+
+      - name: Pick the release tag
+        run: |
+          day=$(TZ=Asia/Kolkata date +%Y.%m.%d)
+          count=$(git tag -l "$day.*" | grep -cE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true)
+          echo "RELEASE_TAG=$day.$((count + 1))" >>"$GITHUB_ENV"
+
+      # Plain (non-force) push: main only moves if it is still an ancestor of the tested commit.
+      - name: Fast-forward main and tag the release
+        run: |
+          git push --atomic "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}" \
+            "$SHA:refs/heads/main" "$SHA:refs/tags/$RELEASE_TAG"
+
+      # ponytail: placeholder deploy. Replace with promoting the QA-tested artifacts.
+      - name: Deploy to production
+        run: echo "Deploying $RELEASE_TAG ($SHA, PRs $PRS_INPUT tested in $QA_TAG) to production"
+
+      - name: Update the queues
+        run: |
+          for stage in develop qa; do
+            gh workflow run poc-queue-manager.yml --repo "$GITHUB_REPOSITORY" --ref main \
+              -f stage="$stage" -f reason="merged $PRS_INPUT as $RELEASE_TAG"
+          done
+
+      - name: Write job summary
+        run: |
+          {
+            echo "## Merged PRs $PRS_INPUT to main as $RELEASE_TAG"
+            echo
+            echo "Tested in \`$QA_TAG\` · main is now \`$SHA\`"
+          } >>"$GITHUB_STEP_SUMMARY"

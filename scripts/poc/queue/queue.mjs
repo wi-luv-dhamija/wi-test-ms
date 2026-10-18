@@ -1,43 +1,72 @@
 // Pure release-queue logic: the state model, command parsing and state transitions.
 // No GitHub API calls here, so everything in this file is unit-testable.
 //
-// The queue validates itself continuously: every change to the set of queued PRs (or to main)
-// bumps `revision`, and the newest revision is always the one being validated.
+// There are two queues (stages), each validating itself continuously: every change to its queued
+// PRs (or to main) bumps `revision`, and the newest revision is built and deployed to the stage's
+// environment. A PR can join `qa` only once its current revision was deployed by `develop`.
+// QA then approves PRs (`/approve qa`), and `/merge qa` merges the approved PRs to main in queue
+// order.
+
+export const STAGES = {
+  develop: { name: 'develop', title: 'POC Develop Queue', idPrefix: 'dev' },
+  qa: { name: 'qa', title: 'POC QA Queue', idPrefix: 'qa', after: 'develop' },
+};
+/** Commands are `/<verb> <stage> [args]`, e.g. `/add develop`, `/hold qa #3`. */
+export const command = (verb, stage) => `/${verb} ${stage}`;
 
 /** In the queue: every one of these is part of the next candidate, in order. */
-export const IN_QUEUE = new Set(['QUEUED', 'VALIDATING', 'VALIDATED']);
-/** Ejected: out of candidates until `/queue retry` (same place) or `/queue add` (end). */
+export const IN_QUEUE = new Set(['QUEUED', 'VALIDATING', 'VALIDATED', 'DEPLOYED']);
+/** Ejected: out of candidates until `retry` (same place) or `add` (end). */
 export const EJECTED = new Set(['TEST_FAILED', 'MERGE_CONFLICT', 'STALE_PR', 'BLOCKED']);
 /** Kept on the queue page but excluded from candidates. */
 export const PARKED = new Set(['HELD', 'READY']);
 /** No longer part of the queue (history only). */
 export const INACTIVE = new Set(['REMOVED', 'MERGED']);
 
-export const STATE_LABELS = {
-  READY: 'queue:ready',
-  QUEUED: 'queue:queued',
-  VALIDATING: 'queue:validating',
-  VALIDATED: 'queue:validated',
-  HELD: 'queue:held',
-  TEST_FAILED: 'queue:test-failed',
-  MERGE_CONFLICT: 'queue:merge-conflict',
-  STALE_PR: 'queue:stale',
-  BLOCKED: 'queue:blocked',
+const LABEL_SUFFIX = {
+  READY: 'ready',
+  QUEUED: 'queued',
+  VALIDATING: 'validating',
+  VALIDATED: 'validated',
+  DEPLOYED: 'deployed',
+  HELD: 'held',
+  TEST_FAILED: 'test-failed',
+  MERGE_CONFLICT: 'merge-conflict',
+  STALE_PR: 'stale',
+  BLOCKED: 'blocked',
 };
-export const LABEL_COLORS = {
-  'queue:ready': ['c5def5', 'Waiting for the queue to unfreeze'],
-  'queue:queued': ['fbca04', 'Queued; waiting for the next candidate'],
-  'queue:validating': ['1d76db', 'Part of the candidate being validated'],
-  'queue:validated': ['0e8a16', 'Validated with the current queue'],
-  'queue:held': ['bfd4f2', 'Held: excluded from candidates'],
-  'queue:test-failed': ['d73a4a', 'Ejected: tests failed in the candidate'],
-  'queue:merge-conflict': ['b60205', 'Ejected: merge conflict in the candidate'],
-  'queue:stale': ['e99695', 'Ejected: new commits; /queue retry or /queue add'],
-  'queue:blocked': ['5319e7', 'Ejected: needs developer action'],
-  'release-queue': ['0052cc', 'POC release queue dashboard'],
+/** The stage's label for an entry, e.g. `qa:deployed`; null for states without one. */
+export const stateLabel = (stage, entry) => {
+  const suffix = isApproved(entry) ? 'approved' : LABEL_SUFFIX[entry.state];
+  return suffix ? `${stage}:${suffix}` : null;
 };
+export function labelColors(stage) {
+  const colors = {
+    ready: ['c5def5', 'Waiting for the queue to unfreeze'],
+    queued: ['fbca04', 'Queued; waiting for the next candidate'],
+    validating: ['1d76db', 'Part of the candidate being validated'],
+    validated: ['c2e0c6', 'Checks passed; waiting for deployment'],
+    deployed: ['0e8a16', `Deployed to the ${stage} environment`],
+    held: ['bfd4f2', 'Held: excluded from candidates'],
+    'test-failed': ['d73a4a', 'Ejected: tests failed in the candidate'],
+    'merge-conflict': ['b60205', 'Ejected: merge conflict in the candidate'],
+    stale: [
+      'e99695',
+      `Ejected: new commits; ${command('retry', stage)} or ${command('add', stage)}`,
+    ],
+    ...(stage === 'qa' ? { approved: ['5ebe30', 'QA approved; merged by /merge qa'] } : {}),
+    blocked: ['5319e7', 'Ejected: needs developer action'],
+  };
+  return {
+    ...Object.fromEntries(Object.entries(colors).map(([k, v]) => [`${stage}:${k}`, v])),
+    'release-queue': ['0052cc', 'POC queue dashboard'],
+  };
+}
 
 export const MUTATING = new Set([
+  'approve',
+  'unapprove',
+  'merge',
   'add',
   'remove',
   'hold',
@@ -48,8 +77,12 @@ export const MUTATING = new Set([
   'freeze',
   'unfreeze',
 ]);
-export const QUEUE_ISSUE_ONLY = new Set(['revalidate', 'freeze', 'unfreeze']);
+export const QUEUE_ISSUE_ONLY = new Set(['revalidate', 'freeze', 'unfreeze', 'merge']);
+export const QA_ONLY = new Set(['approve', 'unapprove', 'merge']);
 export const COMMANDS = [
+  'approve',
+  'unapprove',
+  'merge',
   'add',
   'remove',
   'hold',
@@ -65,9 +98,10 @@ export const COMMANDS = [
 const HISTORY_LIMIT = 15;
 const INACTIVE_LIMIT = 20;
 
-export function emptyState() {
+export function emptyState(stage = 'develop') {
   return {
-    version: 2,
+    version: 3,
+    stage,
     frozen: false,
     frozen_by: null,
     frozen_at: null,
@@ -98,12 +132,17 @@ export function serializeState(state) {
 }
 
 // ---- Commands ----
-/** Parses the first line of a comment. Returns null unless it starts with /queue. */
+/**
+ * Parses the first line of a comment (`/<verb> <stage> [args]`). Returns null unless it starts
+ * with a queue command; `stage` is null when it is missing or unknown.
+ */
 export function parseCommand(body) {
   const line = (body ?? '').trim().split(/\r?\n/)[0].trim();
-  if (!/^\/queue(\s|$)/i.test(line)) return null;
-  const [, name = 'help', ...args] = line.split(/\s+/);
-  return { name: name.toLowerCase(), args };
+  const [first, stage, ...args] = line.split(/\s+/);
+  const name = /^\/([a-z]+)$/i.exec(first)?.[1].toLowerCase();
+  if (!COMMANDS.includes(name)) return null;
+  const known = STAGES[stage?.toLowerCase()] ? stage.toLowerCase() : null;
+  return { name, stage: known, args: known ? args : [stage, ...args].filter(Boolean) };
 }
 
 /** Parses "#5" or "5" into a PR number. */
@@ -119,6 +158,33 @@ export const positionOf = (state, number) => {
 };
 export const queueLine = (entries) => entries.map((e) => `#${e.number}`).join(' → ') || '(empty)';
 
+/** QA approved at the deployed revision. */
+export const isApproved = (e) =>
+  e.state === 'DEPLOYED' && Boolean(e.approved) && e.approved.sha === e.head_sha;
+
+/**
+ * What `/merge qa` merges: the longest run of approved PRs from the front of the deployed queue,
+ * in queue order. Every prefix of a candidate was checked (main + A, main + A + B, ...), so the
+ * merged code is a tested state. `blocker` is the first queued PR that isn't approved.
+ */
+export function mergePlan(state) {
+  const cc = state.current_candidate;
+  const queued = queueEntries(state);
+  if (cc?.status !== 'DEPLOYED') return { prs: [], tag: null, blocker: null };
+  const prs = [];
+  for (const [i, e] of queued.entries()) {
+    if (cc.prs[i] !== e.number || !isApproved(e)) break;
+    prs.push(e.number);
+  }
+  return { prs, tag: cc.tag, blocker: queued[prs.length]?.number ?? null };
+}
+
+/** True if this PR revision was deployed by the stage and is still in its queue. */
+export const isDeployed = (state, number, sha) => {
+  const e = findEntry(state, number);
+  return Boolean(e && IN_QUEUE.has(e.state) && e.deployed_sha === sha);
+};
+
 /** Identifies what would be validated: the queued PRs, in order, at their head SHAs. */
 export const signature = (state) =>
   queueEntries(state)
@@ -132,6 +198,10 @@ export function transition(entry, next, patch = {}) {
     state: next,
     updated_at: patch.updated_at ?? new Date().toISOString(),
   });
+  // Out of the queue means out of the environment once the queue redeploys.
+  if (!IN_QUEUE.has(next)) {
+    Object.assign(entry, { deployed_sha: null, deployed_tag: null, approved: null });
+  }
   return prev;
 }
 
@@ -152,6 +222,9 @@ export function addEntry(state, pr, by, initialState) {
     result_detail: null,
     result_sha: null,
     new_revision: null,
+    deployed_sha: null,
+    deployed_tag: null,
+    approved: null,
     state_reason: null,
     comment_id: existing?.comment_id ?? null,
     comment_hash: null,
@@ -161,7 +234,7 @@ export function addEntry(state, pr, by, initialState) {
   return entry;
 }
 
-/** Moves an entry to the end of the queue (e.g. `/queue resume`, `/queue add` after ejection). */
+/** Moves an entry to the end of the queue (e.g. `resume`, `add` after ejection). */
 export function moveToEnd(state, entry) {
   state.entries.splice(state.entries.indexOf(entry), 1);
   state.entries.push(entry);
@@ -198,7 +271,7 @@ export function pruneInactive(state) {
 
 /**
  * Records a new head SHA. A queued PR pops out of the queue (STALE_PR): the author re-enters it
- * with `/queue retry` (same place) or `/queue add` (end). Returns true if the SHA changed.
+ * with `retry` (same place) or `add` (end). Returns true if the SHA changed.
  */
 export function applyNewRevision(entry, sha) {
   if (!sha || sha === entry.head_sha) return false;
@@ -228,15 +301,15 @@ export function bumpRevision(state) {
 
 export function nextCandidateId(state) {
   state.candidate_counter += 1;
-  return `rc-${String(state.candidate_counter).padStart(3, '0')}`;
+  return `${STAGES[state.stage].idPrefix}-rc-${String(state.candidate_counter).padStart(3, '0')}`;
 }
 
 /**
  * Applies a candidate-builder outcome to the queue.
  * result: { status, first_failing_pr?, passed_prs?, detail?, stale_prs?: {n: currentSha},
- *           candidate_sha?, candidate_tree_sha?, base_main_sha?, note? }
- * The first failing PR is ejected, the passing prefix is VALIDATED and the rest goes back to
- * QUEUED. Returns { changed, revalidate } where `revalidate` means the queue changed (e.g. a PR
+ *           candidate_sha?, candidate_tree_sha?, base_main_sha?, tag?, note? }
+ * DEPLOYED marks every PR deployed. Otherwise the first failing PR is ejected, the passing prefix
+ * is VALIDATED (not deployed) and the rest goes back to QUEUED. Returns { changed, revalidate } where `revalidate` means the queue changed (e.g. a PR
  * was ejected) and should be validated again. PRs held or removed while the candidate ran keep
  * their state and only get the result recorded.
  */
@@ -251,6 +324,7 @@ export function applyResult(state, result) {
     candidate_tree_sha: result.candidate_tree_sha ?? null,
     base_main_sha: result.base_main_sha ?? cc.base_main_sha ?? null,
     detail: result.detail ?? null,
+    tag: result.tag ?? null,
     note: result.note ?? null,
     run_url: result.run_url ?? cc.run_url ?? null,
   });
@@ -266,7 +340,9 @@ export function applyResult(state, result) {
     let next;
     let lastResult;
     let detail = null;
-    if (result.status === 'VALIDATED') {
+    if (result.status === 'DEPLOYED') {
+      [next, lastResult] = ['DEPLOYED', 'PASS'];
+    } else if (result.status === 'VALIDATED') {
       [next, lastResult] = ['VALIDATED', 'PASS'];
     } else if (result.status === 'STALE_PR' && result.stale_prs?.[number]) {
       [next, lastResult] = ['STALE_PR', 'STALE_PR'];
@@ -298,6 +374,8 @@ export function applyResult(state, result) {
     const patch = {
       state_reason: EJECTED.has(next) ? `${result.status} in ${cc.id}` : null,
     };
+    if (next === 'DEPLOYED')
+      Object.assign(patch, { deployed_sha: entry.result_sha, deployed_tag: cc.tag });
     if (next === 'STALE_PR') {
       patch.new_revision = {
         from: entry.result_sha,
@@ -310,10 +388,9 @@ export function applyResult(state, result) {
     changed.push(number);
     if (EJECTED.has(next)) ejected = true;
   });
-  // After an ejection the passing prefix is already validated as a candidate of its own
-  // (main + prefix), so only revalidate if the queue holds something that prefix didn't cover.
+  // After an ejection the rest of the queue is rebuilt without the failing PR, so that it gets
+  // deployed (the failed candidate deployed nothing).
   const queued = queueEntries(state);
-  const revalidate =
-    queued.length > 0 && (stale || (ejected && queued.some((e) => e.state !== 'VALIDATED')));
+  const revalidate = queued.length > 0 && (stale || ejected);
   return { changed, revalidate };
 }

@@ -1,36 +1,31 @@
 name: POC - Queue Manager
 run-name: >-
   ${{
-    github.event_name == 'workflow_dispatch' && format('Queue • VALIDATE • {0}', inputs.reason || 'manual')
+    github.event_name == 'workflow_dispatch' && format('Queue • {0} VALIDATE • {1}', inputs.stage, inputs.reason || 'manual')
     || github.event_name == 'push' && format('Queue • MAIN UPDATED • @{0}', github.event.pusher.name)
     || github.event_name == 'pull_request' && format('Queue • PR {0} • #{1}', github.event.action, github.event.pull_request.number)
-    || startsWith(github.event.comment.body, '/queue') && format('Queue • {0} • #{1} • @{2}',
-      startsWith(github.event.comment.body, '/queue add') && 'ADD'
-      || startsWith(github.event.comment.body, '/queue remove') && 'REMOVE'
-      || startsWith(github.event.comment.body, '/queue hold') && 'HOLD'
-      || startsWith(github.event.comment.body, '/queue resume') && 'RESUME'
-      || startsWith(github.event.comment.body, '/queue retry') && 'RETRY'
-      || startsWith(github.event.comment.body, '/queue status') && 'STATUS'
-      || startsWith(github.event.comment.body, '/queue move') && 'MOVE'
-      || startsWith(github.event.comment.body, '/queue revalidate') && 'REVALIDATE'
-      || startsWith(github.event.comment.body, '/queue freeze') && 'FREEZE'
-      || startsWith(github.event.comment.body, '/queue unfreeze') && 'UNFREEZE'
-      || 'COMMAND',
-      github.event.issue.number, github.event.comment.user.login)
+    || startsWith(github.event.comment.body, '/')
+      && format('Queue • COMMAND • #{0} • @{1}', github.event.issue.number, github.event.comment.user.login)
     || 'Queue • ignored comment'
   }}
 
-# Developer-facing release queue that validates itself: `/queue …` commands, queue:* labels, one
-# sticky status comment per PR, and a central "POC Release Queue" issue that stores the state.
-# Every change to the queued PRs (add/remove/hold/resume/retry/move, new commits, closed PRs) or
-# to main requests a new candidate; the newest queue revision always wins.
+# Two developer-facing queues that validate and deploy themselves:
+#   develop  `/<verb> develop` commands (e.g. `/add develop`), develop:* labels,
+#            "POC Develop Queue" issue → develop env
+#   qa       `/<verb> qa` commands, qa:* labels, "POC QA Queue" issue → qa env. A PR can join
+#            only once its current commit was deployed by the develop queue. QA approves PRs
+#            (`/approve qa`); `/merge qa` dispatches "POC - Release" to merge the approved PRs
+#            to main in queue order.
+# Each issue stores its queue's state; each PR gets one sticky status comment per queue. Every
+# change to a queue's PRs (add/remove/hold/resume/retry/move, new commits, closed PRs) or to main
+# requests a new candidate for that queue; the newest queue revision always wins.
 #
-#   comment / PR event / push to main ──► manage (updates the queue, dispatches a validate run)
-#   validate run: settle (debounce) ─► start (cancel outdated candidate, dispatch builder)
-#                 ─► await (wait for the builder, no lock) ─► record (apply the result)
+#   comment / PR event / push to main ──► manage (updates the queue(s), dispatches validate runs)
+#   validate run (per stage): settle (debounce) ─► start (cancel outdated candidate, dispatch
+#                 builder) ─► await (wait for the builder, no lock) ─► record (apply the result)
 #
-# Code validation stays in "POC - Build Release Candidate". This workflow never merges, pushes,
-# creates branches, or runs PR code. (A workflow_run trigger can't be used: runs dispatched with
+# Checks, tagging and deployment stay in "POC - Build Release Candidate". This workflow never
+# merges, pushes, creates branches, or runs PR code. (A workflow_run trigger can't be used: runs dispatched with
 # GITHUB_TOKEN don't emit it, so the validate run waits for its own candidate instead.)
 on:
   issue_comment:
@@ -42,10 +37,16 @@ on:
     branches: [main]
   push:
     branches: [main]
-  # Dispatched by this workflow after every queue change. Run it by hand (inputs empty) to
-  # revalidate the current queue, e.g. after a flaky failure or if a run was cancelled.
+  # Dispatched by this workflow after every queue change. Run it by hand (revision empty) to
+  # revalidate a queue, e.g. after a flaky failure or if a run was cancelled.
   workflow_dispatch:
     inputs:
+      stage:
+        description: 'Queue to validate'
+        required: true
+        default: develop
+        type: choice
+        options: [develop, qa]
       revision:
         description: 'Queue revision to validate (set by the queue; leave empty for a manual run)'
         required: false
@@ -70,7 +71,7 @@ jobs:
   status:
     if: >-
       github.event_name == 'issue_comment'
-      && startsWith(github.event.comment.body, '/queue status')
+      && startsWith(github.event.comment.body, '/status ')
       && github.event.comment.user.type != 'Bot'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -87,15 +88,17 @@ jobs:
   manage:
     if: >-
       (github.event_name == 'issue_comment'
-        && startsWith(github.event.comment.body, '/queue')
-        && !startsWith(github.event.comment.body, '/queue status')
+        && startsWith(github.event.comment.body, '/')
+        && !startsWith(github.event.comment.body, '/status ')
         && github.event.comment.user.type != 'Bot')
       || github.event_name == 'push'
       || (github.event_name == 'pull_request'
-        && contains(join(github.event.pull_request.labels.*.name, ' '), 'queue:'))
+        && (contains(join(github.event.pull_request.labels.*.name, ' '), 'develop:')
+          || contains(join(github.event.pull_request.labels.*.name, ' '), 'qa:')))
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # One queue mutation at a time; a running mutation is never cancelled.
+    # One queue mutation at a time (both queues share the lock: PR and main events change both);
+    # a running mutation is never cancelled.
     # ponytail: GitHub keeps one pending job per group, so a 3rd job arriving while one runs and
     # one waits replaces the waiting one (shown as cancelled). Queue changes self-heal because the
     # next change revalidates; re-issue a lost command. Use an external lock if this matters.
@@ -145,6 +148,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           QUEUE_MODE: start
+          QUEUE_STAGE: ${{ inputs.stage }}
           REVISION: ${{ inputs.revision }}
           REASON: ${{ inputs.reason }}
 
@@ -167,6 +171,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           QUEUE_MODE: await
+          QUEUE_STAGE: ${{ inputs.stage }}
           CANDIDATE_ID: ${{ needs.start.outputs.candidate_id }}
 
   record:
@@ -188,12 +193,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ needs.await.outputs.run_id }}
         run: |
-          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/candidate-artifacts" \
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --pattern 'candidate-*' \
+            --dir "$RUNNER_TEMP/candidate-artifacts" \
             || echo "No artifacts for run $RUN_ID; the result is derived from the run's steps."
       - name: Record the candidate result
         run: node scripts/poc/queue/main.mjs
         env:
           GITHUB_TOKEN: ${{ github.token }}
           QUEUE_MODE: record
+          QUEUE_STAGE: ${{ inputs.stage }}
           RESULT_RUN_ID: ${{ needs.await.outputs.run_id }}
           QUEUE_ARTIFACTS_DIR: ${{ runner.temp }}/candidate-artifacts

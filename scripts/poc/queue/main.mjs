@@ -1,12 +1,14 @@
 #!/usr/bin/env node
-// POC release queue manager. The queue validates itself: every change to the queued PRs (or a
-// push to main) bumps the queue revision and requests a new candidate.
+// POC queue manager for two stages, `develop` and `qa`, each with its own queue issue. A queue
+// validates itself: every change to its queued PRs (or a push to main) bumps its revision and
+// requests a new candidate, which the candidate builder checks and deploys to the stage's
+// environment. A PR joins `qa` only once its current revision was deployed by `develop`.
 //
 // Event handlers (one per run):
-//   issue_comment  `/queue …` commands on PRs or on the queue issue
+//   issue_comment  `/<verb> develop|qa …` commands on PRs or on that stage's queue issue
 //   pull_request   a queued PR was closed/merged or got new commits (new commits pop it out)
-//   push           main changed: revalidate the queue on the new base
-// Validation pipeline (a separate "validate" run of this workflow, one job per mode):
+//   push           main changed: revalidate both queues on the new base
+// Validation pipeline (a separate "validate" run of this workflow per stage, one job per mode):
 //   QUEUE_MODE=start   after a short debounce: skip if a newer revision exists, cancel the
 //                      outdated candidate run, dispatch the candidate builder
 //   QUEUE_MODE=await   wait for that candidate run (no queue lock held)
@@ -30,15 +32,17 @@ import {
 import {
   addEntry,
   applyNewRevision,
+  command,
   applyResult,
   bumpRevision,
-  COMMANDS,
   EJECTED,
   emptyState,
   findEntry,
   IN_QUEUE,
   INACTIVE,
-  LABEL_COLORS,
+  isDeployed,
+  labelColors,
+  mergePlan,
   moveEntry,
   moveToEnd,
   MUTATING,
@@ -47,22 +51,24 @@ import {
   parsePrRef,
   parseState,
   pruneInactive,
+  QA_ONLY,
   QUEUE_ISSUE_ONLY,
   queueEntries,
   queueLine,
   recordHistory,
   signature,
-  STATE_LABELS,
+  STAGES,
+  stateLabel,
   transition,
 } from './queue.mjs';
 import {
-  QUEUE_TITLE,
+  mergeLine as renderMergeLine,
   renderDashboard,
   renderOperationSummary,
   renderPrComment,
   renderResultSummary,
   renderStatus,
-  STICKY_MARKER,
+  stickyMarker,
 } from './render.mjs';
 
 const EVENT = process.env.GITHUB_EVENT_NAME;
@@ -70,10 +76,12 @@ const ev = JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8'));
 const BASE = process.env.QUEUE_BASE_BRANCH ?? 'main';
 const CANDIDATE_WORKFLOW = process.env.CANDIDATE_WORKFLOW ?? 'poc-candidate-builder.yml';
 const QUEUE_WORKFLOW = process.env.QUEUE_WORKFLOW ?? 'poc-queue-manager.yml';
+const RELEASE_WORKFLOW = process.env.RELEASE_WORKFLOW ?? 'poc-release.yml';
 const BUILDER_NAME = 'POC - Build Release Candidate';
 const IGNORED_ACTORS = new Set((process.env.QUEUE_IGNORED_ACTORS ?? '').split(',').filter(Boolean));
 const REF = ev.repository?.default_branch ?? BASE;
 const ACTOR = process.env.GITHUB_ACTOR ?? 'unknown';
+const STAGE = process.env.QUEUE_STAGE ?? 'develop'; // validation runs
 
 const summary = (md) =>
   process.env.GITHUB_STEP_SUMMARY && appendFileSync(process.env.GITHUB_STEP_SUMMARY, md + '\n');
@@ -84,17 +92,18 @@ const short = (sha) => sha?.slice(0, 12);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // ---- Queue issue (the durable state) ----
-async function loadQueue({ create }) {
+async function loadQueue(stage, { create }) {
+  const { title } = STAGES[stage];
   const issues = await paginate(`${REPO}/issues?labels=release-queue&state=open`);
   let issue = issues
-    .filter((i) => !i.pull_request && i.title === QUEUE_TITLE)
+    .filter((i) => !i.pull_request && i.title === title)
     .sort((a, b) => a.number - b.number)[0];
   if (!issue) {
     if (!create) return null;
-    await ensureLabels(LABEL_COLORS);
-    const state = emptyState();
+    await ensureLabels(labelColors(stage));
+    const state = emptyState(stage);
     issue = await api('POST', `${REPO}/issues`, {
-      title: QUEUE_TITLE,
+      title,
       labels: ['release-queue'],
       body: renderDashboard(state),
     });
@@ -121,6 +130,7 @@ const hash = (text) => createHash('sha1').update(text).digest('hex');
  * dispatches the validation run if this change requested one.
  */
 async function save(ctx, touched = new Set()) {
+  const { stage } = ctx.state;
   pruneInactive(ctx.state);
   await api('PATCH', `${REPO}/issues/${ctx.issue.number}`, { body: renderDashboard(ctx.state) });
   let refreshed = false;
@@ -128,13 +138,13 @@ async function save(ctx, touched = new Set()) {
     const isTouched = touched.has(e.number);
     if (INACTIVE.has(e.state) && !isTouched) continue;
     try {
-      if (isTouched) await setQueueLabel(e.number, STATE_LABELS[e.state] ?? null);
+      if (isTouched) await setQueueLabel(e.number, `${stage}:`, stateLabel(stage, e));
       const meta = { dashboardUrl: ctx.issue.html_url };
       const h = hash(renderPrComment(ctx.state, e, { ...meta, now: 'fixed' }));
       if (isTouched || h !== e.comment_hash) {
         e.comment_id = await upsertSticky(
           e.number,
-          STICKY_MARKER,
+          stickyMarker(stage),
           renderPrComment(ctx.state, e, meta),
           e.comment_id,
         );
@@ -155,12 +165,12 @@ async function save(ctx, touched = new Set()) {
     try {
       await api('POST', `${REPO}/actions/workflows/${QUEUE_WORKFLOW}/dispatches`, {
         ref: REF,
-        inputs: { revision: String(revision), reason },
+        inputs: { stage, revision: String(revision), reason },
       });
-      console.log(`Requested validation of queue revision ${revision} (${reason}).`);
+      console.log(`Requested ${stage} validation of queue revision ${revision} (${reason}).`);
     } catch (err) {
       console.log(
-        `::error::Could not start validation: ${err.message}. Run "POC - Queue Manager" manually to revalidate.`,
+        `::error::Could not start validation: ${err.message}. Run "POC - Queue Manager" manually (stage ${stage}) to revalidate.`,
       );
     }
   }
@@ -234,6 +244,18 @@ async function reenter(ctx, entry, { toEnd }, notes) {
   return true;
 }
 
+/**
+ * For a stage with a prior stage (qa): why this PR revision may not be in it yet, or null.
+ * Only a revision the prior stage deployed (and still queues) may enter.
+ */
+async function notDeployedBefore(stage, pr) {
+  const after = STAGES[stage].after;
+  if (!after) return null;
+  const prior = await loadQueue(after, { create: false });
+  if (prior && isDeployed(prior.state, pr.number, pr.head.sha)) return null;
+  return `PR #${pr.number} can join the ${stage} queue only after its current commit (\`${short(pr.head.sha)}\`) is deployed by the ${after} queue. Use \`${command('add', after)}\` first.`;
+}
+
 // ---- Commands ----
 async function handleComment() {
   const { comment: c, issue } = ev;
@@ -242,10 +264,18 @@ async function handleComment() {
     return console.log(`Ignoring comment by ${user}.`);
   }
   const cmd = parseCommand(c.body);
-  if (!cmd) return console.log('Not a /queue command.');
+  if (!cmd) return console.log('Not a queue command.');
+  if (!cmd.stage) {
+    await comment(
+      issue.number,
+      `Say which queue: \`/${cmd.name} develop\` or \`/${cmd.name} qa\`.`,
+    );
+    return react(c.id, 'confused');
+  }
+  const q = (verb) => command(verb, cmd.stage);
 
   const mutating = MUTATING.has(cmd.name);
-  const ctx = await loadQueue({ create: mutating });
+  const ctx = await loadQueue(cmd.stage, { create: mutating });
   const onPr = Boolean(issue.pull_request);
   const onQueueIssue = ctx?.issue.number === issue.number;
   const op = { name: cmd.name, by: user, pr: null, outcome: 'DONE' };
@@ -264,16 +294,11 @@ async function handleComment() {
     return finish(message);
   };
 
-  if (!COMMANDS.includes(cmd.name)) {
-    op.outcome = 'HELP';
-    return finish(
-      `Unknown queue command \`${cmd.name}\`. Available: ${COMMANDS.map((n) => `\`/queue ${n}\``).join(', ')}.`,
-      'confused',
-    );
+  if (QA_ONLY.has(cmd.name) && cmd.stage !== 'qa') {
+    return reject(`\`/${cmd.name}\` only applies to the QA queue: \`/${cmd.name} qa\`.`);
   }
   if (!ctx) {
-    op.message =
-      'The release queue has not been created yet. It is created by the first `/queue add`.';
+    op.message = `The ${cmd.stage} queue has not been created yet. It is created by the first \`${q('add')}\`.`;
     return finish(op.message);
   }
   if (!onPr && !onQueueIssue) {
@@ -287,9 +312,7 @@ async function handleComment() {
     );
   }
   if (QUEUE_ISSUE_ONLY.has(cmd.name) && !onQueueIssue) {
-    return reject(
-      `\`/queue ${cmd.name}\` is only available on the queue issue #${ctx.issue.number}.`,
-    );
+    return reject(`\`${q(cmd.name)}\` is only available on the queue issue #${ctx.issue.number}.`);
   }
 
   const prArg = cmd.args.map(parsePrRef).find((n, i) => n && cmd.args[i].startsWith('#'));
@@ -304,11 +327,59 @@ async function handleComment() {
     'Queue is currently frozen.\n\nThis PR will not be added to the active candidate.';
 
   switch (cmd.name) {
+    case 'approve':
+    case 'unapprove': {
+      if (!entry || INACTIVE.has(entry.state))
+        return reject(`PR #${target} is not in the QA queue.`);
+      if (cmd.name === 'unapprove') {
+        if (!entry.approved) return reject(`PR #${target} is not QA approved.`);
+        entry.approved = null;
+        recordHistory(state, { op: 'UNAPPROVE', pr: target, by: user });
+        touched.add(target);
+        break;
+      }
+      // Approve exactly what QA saw: the revision deployed to the QA environment.
+      const pr = await refreshEntry(entry, notes);
+      if (!pr || entry.state !== 'DEPLOYED' || entry.deployed_sha !== entry.head_sha) {
+        touched.add(target);
+        await save(ctx, touched);
+        return reject(
+          [
+            `PR #${target} can be approved only while its current commit is deployed to QA (it is ${entry.state}).`,
+            ...notes,
+          ].join('\n\n'),
+        );
+      }
+      entry.approved = { by: user, sha: entry.head_sha, at: new Date().toISOString() };
+      recordHistory(state, { op: 'APPROVE', pr: target, by: user, detail: short(entry.head_sha) });
+      touched.add(target);
+      op.message = renderMergeLine(state);
+      break;
+    }
+
+    case 'merge': {
+      const { prs, tag, blocker } = mergePlan(state);
+      if (!prs.length) {
+        return reject(
+          blocker
+            ? `Nothing to merge: #${blocker} is first in the QA queue and is not QA approved (or not deployed). Approve it, or \`/hold qa #${blocker}\` so the queue redeploys without it.`
+            : 'Nothing to merge: the QA queue has no deployed candidate.',
+        );
+      }
+      await api('POST', `${REPO}/actions/workflows/${RELEASE_WORKFLOW}/dispatches`, {
+        ref: REF,
+        inputs: { tag, prs: prs.join(',') },
+      });
+      recordHistory(state, { op: 'MERGE', by: user, detail: `${refs(prs)} from ${tag}` });
+      op.message = `Merging ${refs(prs)} to main in queue order (tested as \`${tag}\`): see **POC - Release** in Actions.${blocker ? ` #${blocker} and later PRs stay in the queue (#${blocker} is not approved).` : ''}`;
+      break;
+    }
+
     case 'status': {
       op.outcome = 'READ-ONLY';
       if (onPr && !entry) {
         return finish(
-          `PR #${target} is not in the release queue. Use \`/queue add\` to join.\n\n${renderStatus(state, null)}`,
+          `PR #${target} is not in the ${cmd.stage} queue. Use \`${q('add')}\` to join.\n\n${renderStatus(state, null)}`,
         );
       }
       return finish(renderStatus(state, entry));
@@ -316,11 +387,11 @@ async function handleComment() {
 
     case 'add': {
       if (!target)
-        return reject('Use `/queue add` on a PR, or `/queue add #PR` on the queue issue.');
+        return reject(`Use \`${q('add')}\` on a PR, or \`${q('add')} #PR\` on the queue issue.`);
       if (entry && IN_QUEUE.has(entry.state)) {
         return reject(`PR #${target} is already in the queue (${entry.state}).`);
       }
-      if (entry?.state === 'HELD') return reject(`PR #${target} is held. Use \`/queue resume\`.`);
+      if (entry?.state === 'HELD') return reject(`PR #${target} is held. Use \`${q('resume')}\`.`);
       if (entry?.state === 'READY') {
         return reject(`PR #${target} is already waiting for the queue to unfreeze.`);
       }
@@ -331,11 +402,13 @@ async function handleComment() {
       if (pr.base.ref !== BASE) {
         return reject(`PR #${target} targets \`${pr.base.ref}\` instead of \`${BASE}\`.`);
       }
+      const notReady = await notDeployedBefore(cmd.stage, pr);
+      if (notReady) return reject(notReady);
       op.prev = entry?.state ?? 'NOT_QUEUED';
       if (state.frozen) {
         if (entry && EJECTED.has(entry.state)) {
           return reject(
-            `${frozenMessage} It stays ${entry.state}; re-add it after \`/queue unfreeze\`.`,
+            `${frozenMessage} It stays ${entry.state}; re-add it after \`${q('unfreeze')}\`.`,
           );
         }
         addEntry(state, prInfo(pr), user, 'READY');
@@ -390,7 +463,7 @@ async function handleComment() {
       }
       if (state.frozen) {
         return reject(
-          `${frozenMessage} It stays held; \`/queue resume\` again after \`/queue unfreeze\`.`,
+          `${frozenMessage} It stays held; \`${q('resume')}\` again after \`${q('unfreeze')}\`.`,
         );
       }
       touched.add(target);
@@ -408,10 +481,10 @@ async function handleComment() {
     case 'retry': {
       if (!entry || !EJECTED.has(entry.state)) {
         return reject(
-          `\`/queue retry\` applies to ejected PRs (TEST_FAILED, MERGE_CONFLICT, STALE_PR, BLOCKED); PR #${target} is ${entry?.state ?? 'not queued'}.`,
+          `\`${q('retry')}\` applies to ejected PRs (TEST_FAILED, MERGE_CONFLICT, STALE_PR, BLOCKED); PR #${target} is ${entry?.state ?? 'not queued'}.`,
         );
       }
-      if (state.frozen) return reject(`${frozenMessage} Retry it after \`/queue unfreeze\`.`);
+      if (state.frozen) return reject(`${frozenMessage} Retry it after \`${q('unfreeze')}\`.`);
       op.prev = entry.state;
       touched.add(target);
       if (!(await reenter(ctx, entry, { toEnd: false }, notes))) {
@@ -429,7 +502,7 @@ async function handleComment() {
     case 'move': {
       const pos = Number(cmd.args.find((a) => /^\d+$/.test(a)));
       if (!target || !pos) {
-        return reject('Usage: `/queue move #PR POSITION` (for example `/queue move #5 2`).');
+        return reject(`Usage: \`${q('move')} #PR POSITION\` (for example \`${q('move')} #5 2\`).`);
       }
       if (state.frozen) return reject('Queue is currently frozen. The queue order cannot change.');
       if (!entry || !IN_QUEUE.has(entry.state)) return reject(`PR #${target} is not in the queue.`);
@@ -470,7 +543,7 @@ async function handleComment() {
       }
       recordHistory(state, { op: cmd.name.toUpperCase(), by: user });
       op.message = freezing
-        ? 'Queue is now FROZEN: `/queue add`, `/queue resume`, `/queue retry` and `/queue move` are paused. Removing or holding PRs still works and revalidates the queue.'
+        ? `Queue is now FROZEN: \`${q('add')}\`, \`${q('resume')}\`, \`${q('retry')}\` and \`${q('move')}\` are paused. Removing or holding PRs still works and revalidates the queue.`
         : 'Queue is now OPEN.';
       break;
     }
@@ -508,7 +581,7 @@ async function findCandidateRun(candidateId, notBefore) {
 
 /** QUEUE_MODE=start: validate the newest queue revision (REVISION empty = manual run). */
 async function startCandidate() {
-  const ctx = await loadQueue({ create: false });
+  const ctx = await loadQueue(STAGE, { create: false });
   if (!ctx) return summary('# Queue Validation\n\nNo queue exists yet.');
   const { state } = ctx;
   const touched = new Set();
@@ -525,13 +598,20 @@ async function startCandidate() {
     return summary(`# Queue Validation\n\n${msg}`);
   }
 
-  // Re-check every queued PR: closed PRs leave, new commits pop out, drafts are blocked.
+  // Re-check every queued PR: closed PRs leave, new commits pop out, drafts are blocked, and
+  // (qa) every PR must still be deployed by the prior stage at this revision.
   for (const e of queueEntries(state)) {
     touched.add(e.number);
     const pr = await refreshEntry(e, notes);
-    if (pr && IN_QUEUE.has(e.state) && (pr.draft || pr.base.ref !== BASE)) {
+    if (!pr || !IN_QUEUE.has(e.state)) continue;
+    const notReady = await notDeployedBefore(STAGE, pr);
+    if (pr.draft || pr.base.ref !== BASE || notReady) {
       transition(e, 'BLOCKED', {
-        state_reason: pr.draft ? 'PR is a draft' : `PR targets ${pr.base.ref}`,
+        state_reason: pr.draft
+          ? 'PR is a draft'
+          : pr.base.ref !== BASE
+            ? `PR targets ${pr.base.ref}`
+            : `not deployed by ${STAGES[STAGE].after} at ${short(pr.head.sha)}`,
       });
     }
   }
@@ -594,7 +674,7 @@ async function startCandidate() {
   try {
     await api('POST', `${REPO}/actions/workflows/${CANDIDATE_WORKFLOW}/dispatches`, {
       ref: REF,
-      inputs: { candidate_id: id, prs: numbers.join(',') },
+      inputs: { candidate_id: id, prs: numbers.join(','), stage: STAGE },
     });
   } catch (err) {
     for (const e of prs) transition(e, 'QUEUED');
@@ -624,7 +704,7 @@ async function awaitCandidate() {
   const pollMs = Number(process.env.QUEUE_POLL_SECONDS ?? 20) * 1000;
   const deadline = Date.now() + 50 * 60 * 1000;
   for (;;) {
-    const cc = (await loadQueue({ create: false }))?.state.current_candidate;
+    const cc = (await loadQueue(STAGE, { create: false }))?.state.current_candidate;
     if (cc?.id !== candidateId || cc.status !== 'VALIDATING') {
       return console.log(
         `Candidate ${candidateId} is no longer current (${cc?.id}: ${cc?.status}).`,
@@ -699,12 +779,21 @@ function mergeDetail(d) {
 /** Works out the candidate outcome, preferring the builder's structured artifacts. */
 async function readResult(run, cc) {
   const manifest = findArtifact('candidate-manifest.json');
-  if (run.conclusion === 'success' && manifest) {
+  const deployment = findArtifact('deployment.json');
+  if (run.conclusion === 'success' && manifest && deployment) {
     return {
-      status: 'VALIDATED',
+      status: 'DEPLOYED',
       candidate_sha: manifest.candidate_sha,
       candidate_tree_sha: manifest.candidate_tree_sha,
       base_main_sha: manifest.base_main_sha,
+      tag: deployment.tag,
+    };
+  }
+  // Checks passed but the deploy job failed: not any one PR's fault, so nobody is ejected.
+  if (manifest && run.conclusion === 'failure') {
+    return {
+      status: 'DEPLOY_FAILED',
+      note: 'Checks passed but the deployment failed; see the run.',
     };
   }
   const test = findArtifact('candidate-test-diagnosis.json');
@@ -728,7 +817,10 @@ async function readResult(run, cc) {
   if (run.conclusion === 'cancelled')
     return { status: 'CANCELLED', note: 'The candidate run was cancelled.' };
   if (run.conclusion === 'success')
-    return { status: 'FAILED', note: 'The run succeeded but no candidate manifest was found.' };
+    return {
+      status: 'FAILED',
+      note: 'The run succeeded but no candidate/deployment manifest was found.',
+    };
 
   // No structured artifact (lint/build/install failures, stale or invalid input): use the failed step.
   const { jobs } = await api('GET', `${REPO}/actions/runs/${run.id}/jobs`);
@@ -784,7 +876,7 @@ async function readResult(run, cc) {
 /** QUEUE_MODE=record: apply a finished candidate run to the queue. */
 async function handleResult(run) {
   const id = /^Candidate (\S+) \(PRs /.exec(run.display_title ?? '')?.[1];
-  const ctx = await loadQueue({ create: false });
+  const ctx = await loadQueue(STAGE, { create: false });
   const cc = ctx?.state.current_candidate;
   if (!ctx || !id || cc?.id !== id || cc.status !== 'VALIDATING') {
     const why = `Candidate run "${run.display_title}" is not the queue's validating candidate (${cc ? `${cc.id}: ${cc.status}` : 'none'}); nothing to update.`;
@@ -829,12 +921,12 @@ async function handleResult(run) {
 }
 
 // ---- PR and main changes ----
-async function handlePrEvent() {
+async function handlePrEvent(stage) {
   const pr = ev.pull_request;
-  const ctx = await loadQueue({ create: false });
+  const ctx = await loadQueue(stage, { create: false });
   const entry = ctx && findEntry(ctx.state, pr.number);
   if (!entry || INACTIVE.has(entry.state))
-    return console.log(`PR #${pr.number} is not in the queue.`);
+    return console.log(`PR #${pr.number} is not in the ${stage} queue.`);
   const before = signature(ctx.state);
   const op = {
     name: `pr ${ev.action}`,
@@ -870,10 +962,10 @@ async function handlePrEvent() {
   summary(renderOperationSummary(ctx.state, op));
 }
 
-async function handlePush() {
-  const ctx = await loadQueue({ create: false });
+async function handlePush(stage) {
+  const ctx = await loadQueue(stage, { create: false });
   if (!ctx || !queueEntries(ctx.state).length)
-    return console.log('Queue is empty; nothing to revalidate.');
+    return console.log(`The ${stage} queue is empty; nothing to revalidate.`);
   const touched = new Set();
   requestValidation(ctx, `main updated to ${short(ev.after)}`, touched);
   await save(ctx, touched);
@@ -893,8 +985,8 @@ try {
   else if (mode === 'await') await awaitCandidate();
   else if (mode === 'record') await handleResult(await candidateRun(process.env.RESULT_RUN_ID));
   else if (EVENT === 'issue_comment') await handleComment();
-  else if (EVENT === 'pull_request') await handlePrEvent();
-  else if (EVENT === 'push') await handlePush();
+  else if (EVENT === 'pull_request') for (const s of Object.keys(STAGES)) await handlePrEvent(s);
+  else if (EVENT === 'push') for (const s of Object.keys(STAGES)) await handlePush(s);
   else console.log(`Unhandled event ${EVENT}.`);
 } catch (err) {
   console.log(`::error::${err.message}`);

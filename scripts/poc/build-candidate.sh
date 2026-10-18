@@ -2,7 +2,8 @@
 # Steps 3, 5-7: create the temporary candidate branch from the captured main SHA, then merge PRs
 # one at a time in the given order, running install/lint/test/build after each merge.
 # Stops at the first merge conflict or failed check. Never pushes anything.
-# Env: CANDIDATE_ID, BASE_MAIN_SHA, RUNNER_TEMP
+# MERGE_ONLY=1 skips the checks: the deploy job uses it to recreate the validated commit.
+# Env: CANDIDATE_ID, BASE_MAIN_SHA, RUNNER_TEMP, MERGE_ONLY
 set -uo pipefail
 
 state="$RUNNER_TEMP/poc-state"
@@ -105,6 +106,7 @@ for ((i = 0; i < total; i++)); do
     printf '%s\t%s\n' "$label" "$failure" >>"$state/steps.tsv"
     report_failure "$number" "$title"
   fi
+  [[ -n "${MERGE_ONLY:-}" ]] && continue
 
   # The JSON report is overwritten per state, so it always describes the latest test run.
   rm -f "$state/vitest-report.json"

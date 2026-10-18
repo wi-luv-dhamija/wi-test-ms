@@ -45,8 +45,9 @@ To reset data, clear the `flowboard.tasks` key from localStorage.
 
 `.github/workflows/poc-candidate-builder.yml` (**POC - Build Release Candidate**) combines the
 latest `main` with an ordered list of PRs and validates each cumulative state (`main + A`,
-`main + A + B`, ...) with `npm ci`, lint, test and build. It never merges, pushes, tags or deploys.
-If every state passes and neither `main` nor any selected PR moved during the run, it uploads
+`main + A + B`, ...) with `npm ci`, lint, test and build. It never merges or pushes to a branch.
+With `stage` set to `develop` or `qa` (as the queues do), a validated candidate is tagged and
+deployed; a manual run defaults to `none` (validate only). If every state passes and neither `main` nor any selected PR moved during the run, it uploads
 `candidate-manifest.json` as the artifact `candidate-manifest-<candidate_id>`. The logic lives in
 `scripts/poc/`.
 
@@ -77,34 +78,57 @@ base SHA and PR head SHAs, so nothing is checked out or pushed. The summary ends
 collaborators and resolution steps, and `candidate-merge-diagnosis.json` is uploaded with the
 diagnosis artifact.
 
-### Release queue manager
+### Develop and QA queues
 
-`.github/workflows/poc-queue-manager.yml` (**POC - Queue Manager**) is a developer-facing queue
-on top of the candidate builder that **validates itself**. It never merges, pushes, creates
-branches or changes code.
+Branches are cut from `main` and PRs target `main`. Each PR then moves through two queues, QA
+approval and an ordered merge, each one a gate:
 
-- **Commands:** comment on a PR with `/queue add`, `remove`, `hold`, `resume`, `retry` or
-  `status`. On the **POC Release Queue** issue, comment `/queue status`, `revalidate`, `freeze`,
-  `unfreeze` or `move #PR POS`. The PR commands also work there as `/queue hold #PR`. Changing
-  the queue needs write access; anyone can use `status`.
-- **Continuous validation:** any change to the queued PRs (add, remove, hold, resume, retry,
-  move, a PR closed or merged) or a push to `main` starts a new candidate of the whole queue,
-  after a 30-second debounce. The newest queue revision wins: an outdated candidate build is
-  cancelled. There is no build command.
-- **Failures eject:** the first failing PR of a candidate leaves the queue (`queue:test-failed`,
-  `queue:merge-conflict` or `queue:blocked`, with its diagnosis). The PRs before it stay
-  validated, and the rest of the queue is revalidated without it.
-- **New commits pop a PR out** (`queue:stale`), because its validation no longer matches the
-  code. `/queue retry` returns an ejected PR to its previous place; `/queue add` puts it at the
-  end.
-- **Visibility:** each PR has one `queue:*` label (`queued` → `validating` → `validated`) and
-  one status comment updated in place. The issue shows the queue, the current candidate, ejected
-  PRs with their diagnosis, and held PRs.
-- **State:** stored as JSON inside the issue description, so don't edit that by hand. Changes to
-  the queue run one at a time.
-- **Manual revalidation:** comment `/queue revalidate`, or run **POC - Queue Manager** by hand
-  with empty inputs (e.g. after a flaky failure). Comment commands use the workflow file on
-  `main`.
+```text
+PR ─/add develop─► Develop queue ─/add qa─► QA queue ─/approve qa─► /merge qa ─► main
+   main + queued PRs checked,   main + QA PRs checked    QA signs off on    approved PRs merged
+   tagged develop/rc-N,         again, tagged qa/rc-N,   each deployed PR   in queue order,
+   deployed to develop          deployed to qa                              tagged YYYY.MM.DD.N
+```
+
+`.github/workflows/poc-queue-manager.yml` (**POC - Queue Manager**) runs both queues. Each has
+its own issue (**POC Develop Queue**, **POC QA Queue**), labels (`develop:*`, `qa:*`) and status
+comment on the PR. The workflow never merges, pushes or runs PR code.
+
+- **Commands** are `/<command> <queue>`. On a PR: `/add develop`, `/remove develop`,
+  `/hold develop`, `/resume develop`, `/retry develop`, `/status develop` (same with `qa`). On a
+  queue issue: `/status <queue>`, `/revalidate <queue>`, `/freeze <queue>`,
+  `/unfreeze <queue>`, `/move <queue> #PR POS`, or a PR
+  command with `#PR` (e.g. `/hold qa #3`). QA only: `/approve qa`, `/unapprove qa` on a PR and
+  `/merge qa` on the QA queue issue. Changing a queue needs write access.
+- **Develop:** any change to the queue, or a push to `main`, builds a new candidate of the whole
+  queue (after a 30-second debounce; the newest revision wins). When every cumulative state
+  passes, the candidate is tagged `develop/rc-<run>` and deployed to the `develop` environment,
+  and its PRs become `develop:deployed`.
+- **QA:** `/add qa` only accepts a PR whose current commit was deployed by the develop queue (and
+  is still in it). The QA queue checks `main` + its own PRs again, tags `qa/rc-<run>` and deploys
+  to the `qa` environment. Each QA candidate re-checks that its PRs are still deployed by develop
+  at the same commit; any that aren't are `qa:blocked`.
+- **QA approval:** `/approve qa` on a PR records who approved which commit (`qa:approved`). It
+  only works while that commit is deployed to QA. The approval survives the QA queue
+  redeploying, and is dropped by new commits or the PR leaving the queue.
+- **Merge:** `/merge qa` merges the approved PRs from the front of the QA queue, in queue order,
+  and stops at the first PR that isn't approved (`/hold qa #N` it to let the PRs behind it go).
+  It dispatches **POC - Release** (`.github/workflows/poc-release.yml`), which fast-forwards
+  `main` to the QA candidate's commit for exactly those PRs. That is code that was checked
+  (every prefix `main + A + B` of a candidate is), not a new merge. GitHub marks the PRs merged.
+  The release is tagged `YYYY.MM.DD.N` (Asia/Kolkata date) and the queues drop the merged PRs.
+  The release refuses if `main` moved or a PR changed since the QA tag was built. The
+  `production` environment can add a final approval (required reviewers in its settings).
+- **Failures eject:** the first failing PR leaves that queue with its diagnosis, and the rest is
+  rebuilt and redeployed without it. New commits pop a PR out of both queues (`*:stale`), so it
+  has to go through develop again before QA. `retry` returns it to its old place; `add` puts it
+  at the end.
+- **Deployment** steps in the candidate builder and release workflows are placeholders: replace
+  them with the real deployment for each environment.
+- **State:** stored as JSON in each queue issue's description, so don't edit that by hand.
+  Queue changes run one at a time.
+- **Manual revalidation:** comment `/revalidate develop` (or `qa`) on the queue issue, or run
+  **POC - Queue Manager** by hand with the stage and an empty revision.
 
 ### Triggering it
 

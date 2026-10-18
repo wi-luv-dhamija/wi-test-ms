@@ -56,11 +56,11 @@ export async function ensureLabels(colors) {
   }
 }
 
-/** Replaces any queue:* label on an issue/PR with `target` (or none); other labels are untouched. */
-export async function setQueueLabel(number, target) {
+/** Replaces any `prefix`* label on an issue/PR with `target` (or none); others are untouched. */
+export async function setQueueLabel(number, prefix, target) {
   const current = (await api('GET', `${REPO}/issues/${number}/labels`)).map((l) => l.name);
   for (const name of current) {
-    if (name.startsWith('queue:') && name !== target) {
+    if (name.startsWith(prefix) && name !== target) {
       await api('DELETE', `${REPO}/issues/${number}/labels/${encodeURIComponent(name)}`, null, {
         allow404: true,
       });

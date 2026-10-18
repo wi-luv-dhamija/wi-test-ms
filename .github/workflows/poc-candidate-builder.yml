@@ -1,11 +1,13 @@
 name: POC - Build Release Candidate
-run-name: Candidate ${{ inputs.candidate_id }} (PRs ${{ inputs.prs }})
+run-name: Candidate ${{ inputs.candidate_id }} (PRs ${{ inputs.prs }}) → ${{ inputs.stage }}
 
 # Combines the latest main with an ordered list of PRs, validating each cumulative state:
 #   main + A, main + A + B, main + A + B + C
-# Read-only: nothing is merged, pushed, tagged or deployed. Output is a candidate manifest, or a
-# diagnosis report on TEST_FAILED (failed tests, likely related PRs) or MERGE_CONFLICT
-# (conflicted files, overlapping PRs, pairwise merge checks), with suggested collaborators.
+# Output is a candidate manifest, or a diagnosis report on TEST_FAILED (failed tests, likely
+# related PRs) or MERGE_CONFLICT (conflicted files, overlapping PRs, pairwise merge checks), with
+# suggested collaborators.
+# With a stage (develop/qa), a validated candidate is then tagged `<stage>/rc-<run number>` and
+# deployed to that environment. Nothing is ever merged or pushed to a branch.
 on:
   workflow_dispatch:
     inputs:
@@ -17,6 +19,12 @@ on:
         description: 'Ordered comma-separated PR numbers, e.g. 12,15,18'
         required: true
         type: string
+      stage:
+        description: 'Environment to deploy a validated candidate to (none = validate only)'
+        required: false
+        default: none
+        type: choice
+        options: [none, develop, qa]
 
 permissions:
   contents: read
@@ -90,6 +98,14 @@ jobs:
           path: ${{ runner.temp }}/poc-state/candidate-manifest.json
           if-no-files-found: error
 
+      - name: Upload build output
+        if: inputs.stage != 'none'
+        uses: actions/upload-artifact@v7
+        with:
+          name: dist-${{ inputs.candidate_id }}
+          path: dist
+          if-no-files-found: error
+
       # Each script exits early unless the failure type is the one it diagnoses.
       - name: Diagnose failure
         id: diagnose
@@ -117,3 +133,85 @@ jobs:
           else
             echo "## Candidate $CANDIDATE_ID - FAILED (before setup; see logs)" >> "$GITHUB_STEP_SUMMARY"
           fi
+
+  # No PR code runs here, so this job can hold the write token.
+  deploy:
+    name: Deploy ${{ inputs.candidate_id }} to ${{ inputs.stage }}
+    needs: build-candidate
+    if: inputs.stage != 'none'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: ${{ inputs.stage }}
+    permissions:
+      contents: write # push the candidate tag
+    env:
+      CANDIDATE_ID: ${{ inputs.candidate_id }}
+      STAGE: ${{ inputs.stage }}
+      TAG: ${{ inputs.stage }}/rc-${{ github.run_number }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download candidate manifest
+        uses: actions/download-artifact@v7
+        with:
+          name: candidate-manifest-${{ inputs.candidate_id }}
+          path: ${{ runner.temp }}/poc-state
+
+      - name: Download build output
+        uses: actions/download-artifact@v7
+        with:
+          name: dist-${{ inputs.candidate_id }}
+          path: ${{ runner.temp }}/dist
+
+      # Merges the same snapshots in the same order (no checks run) and requires the exact SHA
+      # that was validated, so the tag can only point at tested code.
+      - name: Recreate the validated candidate commit
+        run: |
+          mkdir -p "$RUNNER_TEMP/poc-scripts"
+          git archive "$GITHUB_SHA" scripts/poc | tar -x -C "$RUNNER_TEMP/poc-scripts" --strip-components=2
+          manifest="$RUNNER_TEMP/poc-state/candidate-manifest.json"
+          jq .prs "$manifest" >"$RUNNER_TEMP/poc-state/prs.json"
+          expected=$(jq -r .candidate_sha "$manifest")
+          export BASE_MAIN_SHA=$(jq -r .base_main_sha "$manifest")
+          "$RUNNER_TEMP/poc-scripts/fetch-snapshots.sh"
+          MERGE_ONLY=1 "$RUNNER_TEMP/poc-scripts/build-candidate.sh"
+          actual=$(git rev-parse HEAD)
+          if [[ "$actual" != "$expected" ]]; then
+            echo "::error::Recreated candidate $actual does not match the validated $expected."
+            exit 1
+          fi
+          echo "CANDIDATE_SHA=$actual" >>"$GITHUB_ENV"
+
+      - name: Tag the candidate
+        run: git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}" "$CANDIDATE_SHA:refs/tags/$TAG"
+
+      # ponytail: placeholder deploy. Replace with the stage's real deployment of
+      # $RUNNER_TEMP/dist (or trigger Jenkins/Argo with $TAG).
+      - name: Deploy to ${{ inputs.stage }}
+        run: |
+          echo "Deploying $TAG ($CANDIDATE_SHA) to the $STAGE environment:"
+          find "$RUNNER_TEMP/dist" -type f | head -20
+
+      - name: Record the deployment
+        run: |
+          jq -n --arg tag "$TAG" --arg stage "$STAGE" --arg sha "$CANDIDATE_SHA" \
+            --arg candidate_id "$CANDIDATE_ID" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{tag: $tag, stage: $stage, candidate_id: $candidate_id, candidate_sha: $sha, deployed_at: $at}' \
+            >"$RUNNER_TEMP/deployment.json"
+          {
+            echo "## Deployed $TAG to $STAGE"
+            echo
+            echo "Candidate \`$CANDIDATE_ID\` · commit \`$CANDIDATE_SHA\`"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload deployment record
+        uses: actions/upload-artifact@v7
+        with:
+          name: candidate-deployment-${{ inputs.candidate_id }}
+          path: ${{ runner.temp }}/deployment.json
+          if-no-files-found: error

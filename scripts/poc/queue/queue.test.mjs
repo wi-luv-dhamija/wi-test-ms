@@ -5,6 +5,8 @@ import {
   bumpRevision,
   emptyState,
   findEntry,
+  isDeployed,
+  mergePlan,
   moveEntry,
   moveToEnd,
   nextCandidateId,
@@ -14,6 +16,7 @@ import {
   queueEntries,
   serializeState,
   signature,
+  stateLabel,
   transition,
 } from './queue.mjs';
 import { renderDashboard, renderPrComment } from './render.mjs';
@@ -27,7 +30,7 @@ const pr = (number, extra = {}) => ({
   ...extra,
 });
 const queueOf = (...numbers) => {
-  const state = emptyState();
+  const state = emptyState('develop');
   for (const n of numbers) addEntry(state, pr(n), 'alice', 'QUEUED');
   return state;
 };
@@ -55,11 +58,27 @@ describe('queue state persistence', () => {
 });
 
 describe('commands', () => {
-  it('parses only comments starting with /queue', () => {
-    expect(parseCommand('/queue add')).toEqual({ name: 'add', args: [] });
-    expect(parseCommand('  /Queue MOVE #5 2\nplease')).toEqual({ name: 'move', args: ['#5', '2'] });
-    expect(parseCommand('please /queue add')).toBeNull();
-    expect(parseCommand('/queued')).toBeNull();
+  it('parses /<verb> <stage> commands', () => {
+    expect(parseCommand('/add develop')).toEqual({ stage: 'develop', name: 'add', args: [] });
+    expect(parseCommand('  /MOVE QA #5 2\nplease')).toEqual({
+      stage: 'qa',
+      name: 'move',
+      args: ['#5', '2'],
+    });
+    expect(parseCommand('/remove qa')).toMatchObject({ stage: 'qa', name: 'remove' });
+    expect(parseCommand('/add')).toEqual({ stage: null, name: 'add', args: [] });
+    expect(parseCommand('/hold #3')).toEqual({ stage: null, name: 'hold', args: ['#3'] });
+    expect(parseCommand('please /add qa')).toBeNull();
+    expect(parseCommand('/deploy qa')).toBeNull();
+    expect(parseCommand('/queue add')).toBeNull();
+  });
+
+  it('labels each stage separately', () => {
+    expect(stateLabel('develop', { state: 'DEPLOYED' })).toBe('develop:deployed');
+    expect(stateLabel('qa', { state: 'STALE_PR' })).toBe('qa:stale');
+    expect(stateLabel('qa', { state: 'REMOVED' })).toBeNull();
+    const approved = { state: 'DEPLOYED', head_sha: 'a', approved: { sha: 'a' } };
+    expect(stateLabel('qa', approved)).toBe('qa:approved');
   });
 });
 
@@ -92,9 +111,10 @@ describe('queue ordering', () => {
     expect(order(state)).toEqual([1, 2, 3]);
   });
 
-  it('numbers candidates deterministically', () => {
-    const state = emptyState();
-    expect([nextCandidateId(state), nextCandidateId(state)]).toEqual(['rc-001', 'rc-002']);
+  it('numbers candidates deterministically, per stage', () => {
+    const state = emptyState('develop');
+    expect([nextCandidateId(state), nextCandidateId(state)]).toEqual(['dev-rc-001', 'dev-rc-002']);
+    expect(nextCandidateId(emptyState('qa'))).toBe('qa-rc-001');
   });
 });
 
@@ -149,10 +169,20 @@ describe('candidate results', () => {
     return state;
   };
 
-  it('marks every PR validated on success, with nothing more to do', () => {
+  it('marks every PR deployed with the tag, with nothing more to do', () => {
     const state = validating(1, 2, 5);
-    expect(applyResult(state, { status: 'VALIDATED' }).revalidate).toBe(false);
-    expect(states(state)).toEqual({ 1: 'VALIDATED', 2: 'VALIDATED', 5: 'VALIDATED' });
+    expect(applyResult(state, { status: 'DEPLOYED', tag: 'develop/rc-7' }).revalidate).toBe(false);
+    expect(states(state)).toEqual({ 1: 'DEPLOYED', 2: 'DEPLOYED', 5: 'DEPLOYED' });
+    expect(findEntry(state, 2)).toMatchObject({
+      deployed_sha: pr(2).head_sha,
+      deployed_tag: 'develop/rc-7',
+    });
+  });
+
+  it('keeps PRs queued when only the deployment failed', () => {
+    const state = validating(1, 2);
+    expect(applyResult(state, { status: 'DEPLOY_FAILED' }).revalidate).toBe(false);
+    expect(states(state)).toEqual({ 1: 'QUEUED', 2: 'QUEUED' });
   });
 
   it('ejects the first failing PR and revalidates the PRs after it', () => {
@@ -178,10 +208,10 @@ describe('candidate results', () => {
     });
   });
 
-  it('does not rebuild when the failing PR was last (the prefix is already validated)', () => {
+  it('rebuilds the prefix when the failing PR was last, so that it gets deployed', () => {
     const state = validating(1, 2, 3);
     const result = { status: 'MERGE_CONFLICT', first_failing_pr: 3, passed_prs: [1, 2] };
-    expect(applyResult(state, result).revalidate).toBe(false);
+    expect(applyResult(state, result).revalidate).toBe(true);
     expect(order(state)).toEqual([1, 2]);
   });
 
@@ -211,6 +241,91 @@ describe('candidate results', () => {
   });
 });
 
+describe('promotion to qa', () => {
+  const deployed = () => {
+    const state = queueOf(1, 2);
+    for (const n of [1, 2]) {
+      transition(findEntry(state, n), 'DEPLOYED', {
+        deployed_sha: pr(n).head_sha,
+        deployed_tag: 'develop/rc-1',
+      });
+    }
+    return state;
+  };
+
+  it('accepts only the revision develop deployed', () => {
+    const state = deployed();
+    expect(isDeployed(state, 1, pr(1).head_sha)).toBe(true);
+    expect(isDeployed(state, 1, 'f'.repeat(40))).toBe(false);
+    expect(isDeployed(state, 9, pr(9).head_sha)).toBe(false);
+  });
+
+  it('still accepts a deployed PR while develop redeploys', () => {
+    const state = deployed();
+    bumpRevision(state);
+    expect(findEntry(state, 1).state).toBe('QUEUED');
+    expect(isDeployed(state, 1, pr(1).head_sha)).toBe(true);
+  });
+
+  it('rejects a PR that left the develop queue', () => {
+    const state = deployed();
+    transition(findEntry(state, 1), 'HELD');
+    expect(isDeployed(state, 1, pr(1).head_sha)).toBe(false);
+    applyNewRevision(findEntry(state, 2), 'f'.repeat(40));
+    expect(isDeployed(state, 2, 'f'.repeat(40))).toBe(false);
+  });
+});
+
+describe('qa approval and merge', () => {
+  const qaDeployed = (...numbers) => {
+    const state = { ...queueOf(...numbers), stage: 'qa' };
+    for (const n of numbers) {
+      transition(findEntry(state, n), 'DEPLOYED', {
+        deployed_sha: pr(n).head_sha,
+        deployed_tag: 'qa/rc-9',
+      });
+    }
+    state.current_candidate = { id: 'qa-rc-001', prs: numbers, status: 'DEPLOYED', tag: 'qa/rc-9' };
+    return state;
+  };
+  const approve = (state, n) => {
+    findEntry(state, n).approved = { by: 'qa', sha: pr(n).head_sha };
+  };
+
+  it('merges the approved PRs from the front of the queue, in order', () => {
+    const state = qaDeployed(1, 2, 3);
+    approve(state, 1);
+    approve(state, 2);
+    expect(mergePlan(state)).toEqual({ prs: [1, 2], tag: 'qa/rc-9', blocker: 3 });
+  });
+
+  it('stops at the first PR that is not approved', () => {
+    const state = qaDeployed(1, 2, 3);
+    approve(state, 2);
+    approve(state, 3);
+    expect(mergePlan(state)).toEqual({ prs: [], tag: 'qa/rc-9', blocker: 1 });
+  });
+
+  it('merges nothing while the queue is redeploying, but keeps approvals', () => {
+    const state = qaDeployed(1);
+    approve(state, 1);
+    bumpRevision(state);
+    state.current_candidate.status = 'VALIDATING';
+    expect(mergePlan(state).prs).toEqual([]);
+    expect(findEntry(state, 1).approved).not.toBeNull();
+  });
+
+  it('drops the approval on new commits or leaving the queue', () => {
+    const state = qaDeployed(1, 2);
+    approve(state, 1);
+    approve(state, 2);
+    applyNewRevision(findEntry(state, 1), 'f'.repeat(40));
+    transition(findEntry(state, 2), 'HELD');
+    expect(findEntry(state, 1).approved).toBeNull();
+    expect(findEntry(state, 2).approved).toBeNull();
+  });
+});
+
 describe('rendering', () => {
   it('lists ejected PRs with their diagnosis and re-entry commands', () => {
     const state = queueOf(1, 2, 3, 5);
@@ -225,15 +340,29 @@ describe('rendering', () => {
     expect(md).toContain('## ❌ Needs attention');
     expect(md).toContain('| #3 | Tests fail when combined with #1 |');
     expect(md).toContain('#1 ↔ #3');
-    expect(md).not.toContain('/queue build');
+    expect(md).toContain('# 🚦 POC Develop Queue');
+    expect(md).toContain('`/retry develop`');
+    expect(md).not.toContain('/queue');
     expect(parseState(md)).toEqual(state);
   });
 
   it('renders a PR comment with the marker, position and queue', () => {
     const state = queueOf(1, 2, 5);
     const md = renderPrComment(state, findEntry(state, 5));
-    expect(md.startsWith('<!-- POC_QUEUE_STATUS -->')).toBe(true);
+    expect(md.startsWith('<!-- POC_DEVELOP_QUEUE_STATUS -->')).toBe(true);
     expect(md).toContain('**Queue position:** 3 of 3');
     expect(md).toContain('#1 → #2 → **#5**');
+    expect(md).toContain('`/hold develop`');
+  });
+
+  it('points a deployed develop PR at the qa queue and a deployed qa PR at approval', () => {
+    const dev = queueOf(1);
+    transition(findEntry(dev, 1), 'DEPLOYED', { deployed_tag: 'develop/rc-3' });
+    expect(renderPrComment(dev, findEntry(dev, 1))).toContain('`/add qa`');
+    const qa = { ...queueOf(1), stage: 'qa' };
+    transition(findEntry(qa, 1), 'DEPLOYED', { deployed_tag: 'qa/rc-4' });
+    const md = renderPrComment(qa, findEntry(qa, 1));
+    expect(md.startsWith('<!-- POC_QA_QUEUE_STATUS -->')).toBe(true);
+    expect(md).toContain('`/approve qa`');
   });
 });

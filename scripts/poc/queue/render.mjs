@@ -4,18 +4,24 @@ import {
   INACTIVE,
   positionOf,
   queueEntries,
+  command,
+  isApproved,
+  mergePlan,
   queueLine,
   serializeState,
+  STAGES,
 } from './queue.mjs';
 
-export const STICKY_MARKER = '<!-- POC_QUEUE_STATUS -->';
-export const QUEUE_TITLE = 'POC Release Queue';
+/** Each stage keeps its own status comment on a PR. */
+export const stickyMarker = (stage) => `<!-- POC_${stage.toUpperCase()}_QUEUE_STATUS -->`;
 
 const BADGES = {
   READY: '⏳ READY',
   QUEUED: '🟡 QUEUED',
   VALIDATING: '🔄 VALIDATING',
   VALIDATED: '✅ VALIDATED',
+  DEPLOYED: '🚀 DEPLOYED',
+  DEPLOY_FAILED: '❌ DEPLOY_FAILED',
   HELD: '⏸️ HELD',
   TEST_FAILED: '❌ TEST_FAILED',
   MERGE_CONFLICT: '❌ MERGE_CONFLICT',
@@ -98,6 +104,7 @@ function validationLines(cc) {
   if (
     !cc ||
     ![
+      'DEPLOYED',
       'VALIDATED',
       'TEST_FAILED',
       'MERGE_CONFLICT',
@@ -124,8 +131,11 @@ function validationLines(cc) {
 const STATUS_WORDS = {
   QUEUED: '⏳ Waiting for check',
   VALIDATING: '🔄 Being checked',
-  VALIDATED: '✅ Ready',
+  VALIDATED: '✅ Checks passed, deploying',
+  DEPLOYED: '🚀 Deployed',
 };
+const statusWords = (e) =>
+  isApproved(e) ? `✅ QA approved by ${noPing(e.approved.by)}` : STATUS_WORDS[e.state];
 /** Dashboard text must not @-mention people: it is rewritten on every queue change. */
 const noPing = (text) => cell(text).replaceAll('@', '');
 const list = (numbers) => numbers.map((n) => `#${n}`).join(', ');
@@ -152,22 +162,41 @@ function problem(e) {
       return cell(e.state_reason ?? 'Needs attention');
   }
 }
-const NEXT_STEP = {
-  TEST_FAILED: 'Fix it, push, then comment `/queue retry`',
-  MERGE_CONFLICT: 'Resolve the conflict, push, then comment `/queue retry`',
-  STALE_PR: 'Comment `/queue retry` to check the new commits',
-  BLOCKED: 'Fix it, then comment `/queue retry`',
-};
+const nextStep = (state, q) =>
+  ({
+    TEST_FAILED: `Fix it, push, then comment \`${q('retry')}\``,
+    MERGE_CONFLICT: `Resolve the conflict, push, then comment \`${q('retry')}\``,
+    STALE_PR: `Comment \`${q('retry')}\` to check the new commits`,
+  })[state] ?? `Fix it, then comment \`${q('retry')}\``;
+
+/** What to do once everything in the stage is deployed. */
+export const afterDeploy = (stage) =>
+  stage === 'develop'
+    ? 'Comment `/add qa` on a PR to promote it to the QA queue.'
+    : 'QA approves each PR with `/approve qa`; then `/merge qa` on the QA queue issue merges the approved PRs to main in queue order.';
+
+/** One line describing what `/merge qa` would do now. */
+export function mergeLine(state) {
+  const { prs, blocker } = mergePlan(state);
+  const stop = blocker ? ` (stops at #${blocker}: not QA approved yet)` : '';
+  return prs.length
+    ? `**\`/merge qa\` would merge:** ${list(prs)}${stop}`
+    : `**Nothing to merge yet**${stop || ': no deployed, QA-approved PRs'}.`;
+}
 
 function headline(state, queued, ejected) {
+  const q = (verb) => command(verb, state.stage);
+  const cc = state.current_candidate;
   const prs = list(queued.map((e) => e.number));
   let line;
   if (!queued.length) {
-    line = 'The queue is empty. Comment `/queue add` on a pull request to join.';
-  } else if (queued.some((e) => e.state === 'VALIDATING')) {
-    line = `🔄 **Checking ${prs} together…**`;
-  } else if (queued.every((e) => e.state === 'VALIDATED')) {
-    line = `✅ **${prs} ${queued.length > 1 ? 'pass together and are' : 'passes and is'} ready to release.**`;
+    line = `The queue is empty. Comment \`${q('add')}\` on a pull request to join.`;
+  } else if (queued.some((e) => ['VALIDATING', 'VALIDATED'].includes(e.state))) {
+    line = `🔄 **Checking and deploying ${prs} together…**`;
+  } else if (queued.every((e) => e.state === 'DEPLOYED')) {
+    line = `🚀 **${prs} ${queued.length > 1 ? 'are' : 'is'} deployed to ${state.stage} as \`${cc?.tag}\`.** ${afterDeploy(state.stage)}`;
+  } else if (cc && !['VALIDATING', 'SUPERSEDED'].includes(cc.status)) {
+    line = `⚠️ **The last check (${cc.id}) ended ${cc.status}.** Comment \`${q('revalidate')}\` on this issue to try again.`;
   } else {
     line = `⏳ **The queue changed.** A new check of ${prs} starts in a moment.`;
   }
@@ -198,9 +227,11 @@ export function renderDashboard(state, meta = {}) {
     .reverse();
   const cc = state.current_candidate;
 
-  const md = [`# 🚦 ${QUEUE_TITLE}`, ''];
+  const { title } = STAGES[state.stage];
+  const q = (verb) => command(verb, state.stage);
+  const md = [`# 🚦 ${title}`, ''];
   if (state.frozen) {
-    md.push(`> 🧊 **The queue is frozen**: no PR can join until \`/queue unfreeze\`.`, '');
+    md.push(`> 🧊 **The queue is frozen**: no PR can join until \`${q('unfreeze')}\`.`, '');
   }
   md.push(headline(state, queued, ejected), '');
   md.push(
@@ -213,13 +244,14 @@ export function renderDashboard(state, meta = {}) {
     md.push('| # | Pull request | Status |', '|---|---|---|');
     queued.forEach((e, i) =>
       md.push(
-        `| ${i + 1} | #${e.number} | ${STATUS_WORDS[e.state]}${e.new_revision ? ' · 🆕 new commits' : ''} |`,
+        `| ${i + 1} | #${e.number} | ${statusWords(e)}${e.new_revision ? ' · 🆕 new commits' : ''} |`,
       ),
     );
   } else {
     md.push('_Empty._');
   }
   md.push('');
+  if (state.stage === 'qa' && queued.length) md.push(mergeLine(state), '');
 
   if (ejected.length) {
     md.push(
@@ -229,8 +261,7 @@ export function renderDashboard(state, meta = {}) {
       '',
     );
     md.push('| Pull request | Problem | What to do |', '|---|---|---|');
-    for (const e of ejected)
-      md.push(`| #${e.number} | ${problem(e)} | ${NEXT_STEP[e.state] ?? NEXT_STEP.BLOCKED} |`);
+    for (const e of ejected) md.push(`| #${e.number} | ${problem(e)} | ${nextStep(e.state, q)} |`);
     md.push('');
     for (const e of ejected) {
       if (!e.result_detail && !e.failure) continue;
@@ -255,7 +286,7 @@ export function renderDashboard(state, meta = {}) {
     md.push(
       '## ⏸️ On hold',
       '',
-      `${list(held.map((e) => e.number))} — not included in checks. \`/queue resume\` brings a PR back.`,
+      `${list(held.map((e) => e.number))} — not included in checks. \`${q('resume')}\` brings a PR back.`,
       '',
     );
   }
@@ -273,9 +304,9 @@ export function renderDashboard(state, meta = {}) {
     technical.push(
       `- Latest check: **${cc.id}** — ${badge(cc.status)} · ${queueLine(cc.prs.map((number) => ({ number })))} · started ${time(cc.started_at)}${cc.finished_at ? `, finished ${time(cc.finished_at)}` : ''}${cc.reason ? ` · reason: ${noPing(cc.reason)}` : ''}`,
     );
-    if (cc.status === 'VALIDATED') {
+    if (cc.status === 'DEPLOYED') {
       technical.push(
-        `- Candidate SHA ${short(cc.candidate_sha)} · tree ${short(cc.candidate_tree_sha)} · base main ${short(cc.base_main_sha)}`,
+        `- Tag \`${cc.tag}\` · candidate SHA ${short(cc.candidate_sha)} · tree ${short(cc.candidate_tree_sha)} · base main ${short(cc.base_main_sha)}`,
       );
     }
     if (cc.note) technical.push(`- Note: ${cell(cc.note)}`);
@@ -308,9 +339,15 @@ export function renderDashboard(state, meta = {}) {
   }
   md.push(
     ...details('Commands', [
-      '**On a pull request:** `/queue add` join · `/queue remove` leave · `/queue hold` pause · `/queue resume` un-pause · `/queue retry` re-check after a fix · `/queue status`',
+      `**On a pull request:** \`${q('add')}\` join${state.stage === 'qa' ? ' (the PR must be deployed by the develop queue)' : ''} · \`${q('remove')}\` leave · \`${q('hold')}\` pause · \`${q('resume')}\` un-pause · \`${q('retry')}\` re-check after a fix · \`${q('status')}\``,
       '',
-      '**On this issue:** `/queue status` · `/queue revalidate` re-check now · `/queue freeze` / `/queue unfreeze` · `/queue move #PR POS` · any PR command with `#PR`, e.g. `/queue hold #3`',
+      `**On this issue:** \`${q('status')}\` · \`${q('revalidate')}\` re-check now · \`${q('freeze')}\` / \`${q('unfreeze')}\` · \`${q('move')} #PR POS\` · any PR command with \`#PR\`, e.g. \`${q('hold')} #3\``,
+      ...(state.stage === 'qa'
+        ? [
+            '',
+            "**QA:** `/approve qa` / `/unapprove qa` on a deployed PR · `/merge qa` on this issue merges the approved PRs to main in queue order (stops at the first PR that isn't approved)",
+          ]
+        : []),
     ]),
   );
   md.push(serializeState(state));
@@ -320,7 +357,9 @@ export function renderDashboard(state, meta = {}) {
 export function renderPrComment(state, entry, meta = {}) {
   const cc = state.current_candidate;
   const inCandidate = cc?.prs.includes(entry.number);
-  const md = [STICKY_MARKER, '## Release Queue Status', ''];
+  const { title } = STAGES[state.stage];
+  const q = (verb) => command(verb, state.stage);
+  const md = [stickyMarker(state.stage), `## ${title.replace('POC ', '')} Status`, ''];
   md.push(
     `**State:** ${badge(entry.state)}${entry.state_reason ? ` (${entry.state_reason})` : ''}`,
     '',
@@ -359,11 +398,16 @@ export function renderPrComment(state, entry, meta = {}) {
       break;
     case 'VALIDATED':
       if (inCandidate) md.push('**Combined validation:**', '', ...validationLines(cc), '');
-      if (cc?.status === 'VALIDATED' && inCandidate)
-        md.push(
-          `Candidate SHA ${short(cc.candidate_sha)} · tree ${short(cc.candidate_tree_sha)}`,
-          '',
-        );
+      break;
+    case 'DEPLOYED':
+      md.push(`**Deployed to ${state.stage}** as \`${entry.deployed_tag}\`.`, '');
+      if (inCandidate) md.push('**Combined validation:**', '', ...validationLines(cc), '');
+      if (isApproved(entry)) {
+        md.push(`**QA approved** by ${entry.approved.by} at ${short(entry.approved.sha)}.`, '');
+        md.push(mergeLine(state), '');
+      } else {
+        md.push(afterDeploy(state.stage), '');
+      }
       break;
     case 'TEST_FAILED':
     case 'MERGE_CONFLICT':
@@ -386,7 +430,7 @@ export function renderPrComment(state, entry, meta = {}) {
       md.push(
         '**Ejected from the queue.** The rest of the queue is validated without this PR.',
         '',
-        '**Suggested action:** fix this PR (or coordinate with the related PR authors) and push the fix, then `/queue retry` to return to your previous place or `/queue add` to rejoin at the end.',
+        `**Suggested action:** fix this PR (or coordinate with the related PR authors) and push the fix, then \`${q('retry')}\` to return to your previous place or \`${q('add')}\` to rejoin at the end.`,
         '',
       );
       break;
@@ -394,13 +438,13 @@ export function renderPrComment(state, entry, meta = {}) {
       md.push(
         '**New commits were pushed, so this PR left the queue** (its validation no longer matches the code). The rest of the queue is revalidated without it.',
         '',
-        '`/queue retry` returns it to its previous place with the new revision; `/queue add` rejoins at the end.',
+        `\`${q('retry')}\` returns it to its previous place with the new revision; \`${q('add')}\` rejoins at the end.`,
         '',
       );
       break;
     case 'HELD':
       md.push(
-        'Held: excluded from candidates. `/queue resume` puts it back at the end of the active queue.',
+        `Held: excluded from candidates. \`${q('resume')}\` puts it back at the end of the active queue.`,
         '',
       );
       break;
@@ -410,25 +454,26 @@ export function renderPrComment(state, entry, meta = {}) {
     case 'REMOVED':
     case 'MERGED':
       md.push(
-        `No longer in the release queue${entry.state_reason ? `: ${entry.state_reason}` : ''}. \`/queue add\` to rejoin.`,
+        `No longer in the ${state.stage} queue${entry.state_reason ? `: ${entry.state_reason}` : ''}. \`${q('add')}\` to rejoin.`,
         '',
       );
       break;
   }
   const commands =
     {
-      QUEUED: '/queue status · /queue hold · /queue remove',
-      VALIDATING: '/queue status · /queue hold · /queue remove',
-      VALIDATED: '/queue status · /queue hold · /queue remove',
-      HELD: '/queue resume · /queue remove · /queue status',
-      READY: '/queue status · /queue remove',
-      REMOVED: '/queue add',
-      MERGED: '/queue status',
-    }[entry.state] ?? '/queue retry · /queue add · /queue remove · /queue status';
+      QUEUED: 'status · hold · remove',
+      VALIDATING: 'status · hold · remove',
+      VALIDATED: 'status · hold · remove',
+      DEPLOYED: `status · hold · remove${state.stage === 'qa' ? (isApproved(entry) ? ' · unapprove' : ' · approve') : ''}`,
+      HELD: 'resume · remove · status',
+      READY: 'status · remove',
+      REMOVED: 'add',
+      MERGED: 'status',
+    }[entry.state] ?? 'retry · add · remove · status';
   md.push(
     `**Commands:** ${commands
       .split(' · ')
-      .map((c) => `\`${c}\``)
+      .map((c) => `\`${q(c)}\``)
       .join(' · ')}`,
     '',
   );
@@ -486,7 +531,7 @@ export function renderResultSummary(state) {
   const cc = state.current_candidate;
   const failIndex = cc.first_failing_pr ? cc.prs.indexOf(cc.first_failing_pr) : -1;
   const icon = (i) =>
-    cc.status === 'VALIDATED' || (failIndex >= 0 && i < failIndex)
+    ['VALIDATED', 'DEPLOYED'].includes(cc.status) || (failIndex >= 0 && i < failIndex)
       ? '✅'
       : i === failIndex
         ? '❌'
@@ -497,6 +542,7 @@ export function renderResultSummary(state) {
     `**Result:** ${cc.status}`,
     '**Queue:**',
     cc.prs.map((n, i) => `- #${n} ${icon(i)}`).join('\n'),
+    cc.tag ? `**Deployed to ${state.stage}:** \`${cc.tag}\`` : null,
     cc.note ? `**Note:** ${cc.note}` : null,
     `**Queue now:** ${queueLine(queueEntries(state))}`,
   ]
