@@ -8,16 +8,27 @@ interface TaskCardProps {
   onStatusChange: (id: string, status: TaskStatus) => void;
   onEdit: (task: Task) => void;
   onDelete: (id: string) => void;
+  /** Compact row layout for list view; hides the description. */
+  compact?: boolean;
 }
 
-export function TaskCard({ task, onStatusChange, onEdit, onDelete }: TaskCardProps) {
+export function TaskCard({
+  task,
+  onStatusChange,
+  onEdit,
+  onDelete,
+  compact = false,
+}: TaskCardProps) {
   return (
-    <article className={styles.card} aria-label={task.title}>
+    <article
+      className={compact ? `${styles.card} ${styles.compact}` : styles.card}
+      aria-label={task.title}
+    >
       <div className={styles.top}>
         <h3 className={styles.title}>{task.title}</h3>
         <StatusBadge status={task.status} />
       </div>
-      <p className={styles.description}>{task.description}</p>
+      {!compact && <p className={styles.description}>{task.description}</p>}
       <dl className={styles.meta}>
         <dt>Priority</dt>
         <dd className={task.priority === 'High' ? styles.high : undefined}>{task.priority}</dd>
