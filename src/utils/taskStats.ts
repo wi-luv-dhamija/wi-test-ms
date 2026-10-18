@@ -19,3 +19,8 @@ export function getTaskStats(tasks: Task[]): TaskStats {
 export function getRecentTasks(tasks: Task[], limit = 5): Task[] {
   return [...tasks].sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, limit);
 }
+
+/** Whole-number completion percentage; 0 when there are no tasks. */
+export function getCompletionPercentage(completed: number, total: number): number {
+  return total === 0 ? 0 : Math.round((completed / total) * 100);
+}
